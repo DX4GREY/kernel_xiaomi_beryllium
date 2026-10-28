@@ -1366,7 +1366,7 @@ wma_mgmt_tx_ack_comp_hdlr(void *wma_context, qdf_nbuf_t netbuf, int32_t status)
 			 desc_id, status, mapped_status);
 		wma_handle_injection_fw_response(wma_handle, desc_id,
 						 mapped_status);
-		qdf_nbuf_free(netbuf);
+		/* wma_handle_injection_fw_response handles unmapping and freeing */
 		return;
 	}
 

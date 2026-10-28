@@ -661,6 +661,8 @@ void hdd_process_injection_queue_work(void *arg)
 				} else if (cdp_mon_vdev_id != 0xff &&
 					   cdp_mon_vdev_id != (uint8_t)-EINVAL) {
 					tx_vdev_id = cdp_mon_vdev_id;
+				} else if (injection_ctx->adapter) {
+					tx_vdev_id = injection_ctx->adapter->vdev_id;
 				}
 			}
 

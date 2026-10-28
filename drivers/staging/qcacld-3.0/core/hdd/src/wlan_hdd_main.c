@@ -6935,6 +6935,14 @@ QDF_STATUS hdd_stop_adapter(struct hdd_context *hdd_ctx,
 		break;
 
 	case QDF_MONITOR_MODE:
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+		{
+			tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
+
+			if (wma)
+				wma_injection_pre_stop_cleanup(wma);
+		}
+#endif
 		wlan_hdd_scan_abort(adapter);
 		hdd_deregister_hl_netdev_fc_timer(adapter);
 		hdd_deregister_tx_flow_control(adapter);
@@ -18023,6 +18031,14 @@ bool wlan_hdd_check_mon_concurrency(void)
 void wlan_hdd_del_monitor(struct hdd_context *hdd_ctx,
 			  struct hdd_adapter *adapter, bool rtnl_held)
 {
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	{
+		tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
+
+		if (wma)
+			wma_injection_pre_stop_cleanup(wma);
+	}
+#endif
 	wlan_hdd_release_intf_addr(hdd_ctx, adapter->mac_addr.bytes);
 	hdd_stop_adapter(hdd_ctx, adapter);
 	hdd_close_adapter(hdd_ctx, adapter, true);
