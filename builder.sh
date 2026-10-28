@@ -31,6 +31,7 @@ CONF_FILE="${KERNEL_DIR}/builder.conf"
 BASE_DEFCONFIG="arch/arm64/configs/vendor/sdm845-perf_defconfig"
 COMMON_CONFIG="arch/arm64/configs/vendor/xiaomi/sdm845-common.config"
 BERYLLIUM_CONFIG="arch/arm64/configs/vendor/xiaomi/beryllium.config"
+NETHUNTER_CONFIG="${CONFIGS_DIR}/nethunter.config"
 
 # ------------------------------------------------------------------------------
 # COLOR PALETTE (ANSI ESCAPE SEQUENCES)
@@ -279,7 +280,14 @@ CROSS_COMPILE_32="${CROSS_COMPILE_32}"
 EOF
 }
 
+sanitize_source_tree() {
+    # Ensure source tree is completely clean of generated headers and config
+    # to prevent out-of-tree (O=out) build poisoning via GNU Make VPATH
+    rm -rf "${KERNEL_DIR}/arch"/*/include/generated "${KERNEL_DIR}/include/generated" "${KERNEL_DIR}/.config" "${KERNEL_DIR}/include/config"
+}
+
 setup_make_flags() {
+    sanitize_source_tree
     MAKE_FLAGS=(
         "ARCH=${ARCH}"
         "SUBARCH=${SUBARCH}"
@@ -796,68 +804,111 @@ apply_base_beryllium_config() {
     fi
 }
 
+apply_config_fragment() {
+    local frag_file="$1"
+    if [[ ! -f "${frag_file}" ]]; then
+        log_error "Config fragment not found: ${frag_file}"
+        return 1
+    fi
+    log_info "Merging config fragment: ${frag_file}..."
+    setup_make_flags
+    ARCH="${ARCH}" scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" \
+        "${OUT_DIR}/.config" \
+        "${frag_file}"
+    make "${MAKE_FLAGS[@]}" olddefconfig
+    log_success "Fragment '$(basename "${frag_file}")' merged successfully!"
+    return 0
+}
+
+apply_nethunter_config() {
+    local nh_cfg="${NETHUNTER_CONFIG}"
+    if [[ ! -f "${nh_cfg}" && -f "/home/dx4white/Downloads/nethunter.config" ]]; then
+        mkdir -p "${CONFIGS_DIR}"
+        cp "/home/dx4white/Downloads/nethunter.config" "${nh_cfg}"
+    fi
+
+    if [[ ! -f "${nh_cfg}" ]]; then
+        log_error "NetHunter configuration not found at ${nh_cfg}!"
+        return 1
+    fi
+
+    log_info "Applying Kali NetHunter configuration preset..."
+    echo -e "  - Target Fragment : ${C_GREEN}${nh_cfg}${C_RESET}"
+    echo -e "  - Features        : Wi-Fi Injection (Atheros, Realtek, MediaTek, Ralink), SDR, CAN, HID, NFS"
+    apply_config_fragment "${nh_cfg}"
+}
+
 menu_apply_config() {
     print_header
     echo -e "${C_BOLD}${C_BLUE}=== [3] Apply Custom Configuration ===${C_RESET}\n"
 
-    echo "1. Loading Beryllium Base Configuration"
+    echo "Step 1: Applying Beryllium Base Configuration..."
     if ! apply_base_beryllium_config; then
         press_enter
         return 0
     fi
 
     echo ""
-    echo -e "${C_CYAN}2. Scan & Apply Additional Configuration Fragments (.config / fragments)${C_RESET}"
-    mkdir -p "${CONFIGS_DIR}"
+    echo -e "${C_BOLD}Configuration Flavor & Customization:${C_RESET}"
+    echo -e "  ${C_CYAN}1.${C_RESET} Stock Beryllium (Base only, no extra fragments)"
+    echo -e "  ${C_CYAN}2.${C_RESET} Kali NetHunter (Wi-Fi Injection, RTL8187/8192, SDR HackRF, CAN, HID, NFS)"
+    echo -e "  ${C_CYAN}3.${C_RESET} Scan & Select fragment from configs/ directory"
+    echo -e "  ${C_CYAN}4.${C_RESET} Custom fragment file path manually"
+    echo ""
+    echo -en "${C_YELLOW}Select configuration mode [1-4] (default: 2): ${C_RESET}"
+    local cfg_opt
+    read -r cfg_opt || true
+    cfg_opt="${cfg_opt:-2}"
 
-    local config_fragments=()
-    while IFS= read -r -d '' cfg; do
-        config_fragments+=("${cfg}")
-    done < <(find "${CONFIGS_DIR}" -maxdepth 2 -type f \( -name "*.config" -o -name "*_defconfig" \) -print0 2>/dev/null || true)
+    case "${cfg_opt}" in
+        1)
+            log_info "Stock Beryllium configuration applied."
+            ;;
+        2)
+            apply_nethunter_config
+            ;;
+        3)
+            mkdir -p "${CONFIGS_DIR}"
+            local config_fragments=()
+            while IFS= read -r -d '' cfg; do
+                config_fragments+=("${cfg}")
+            done < <(find "${CONFIGS_DIR}" -maxdepth 2 -type f \( -name "*.config" -o -name "*_defconfig" \) -print0 2>/dev/null || true)
 
-    if [[ ${#config_fragments[@]} -gt 0 ]]; then
-        echo -e "Found ${#config_fragments[@]} custom fragment file(s) in '${CONFIGS_DIR}':"
-        local i=1
-        for cfg in "${config_fragments[@]}"; do
-            echo "  $((i))) $(basename "${cfg}") (${cfg})"
-            i=$((i + 1))
-        done
-        echo ""
-        if prompt_confirm "Would you like to merge one of these fragments?" "Y"; then
-            echo -en "${C_YELLOW}Select fragment number [1-${#config_fragments[@]}]: ${C_RESET}"
-            local sel
-            read -r sel || true
-            if [[ "${sel}" =~ ^[0-9]+$ ]] && [[ "${sel}" -ge 1 ]] && [[ "${sel}" -le ${#config_fragments[@]} ]]; then
-                local chosen_frag="${config_fragments[$((sel - 1))]}"
-                log_info "Merging fragment: ${chosen_frag}..."
-                ARCH="${ARCH}" scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" \
-                    "${OUT_DIR}/.config" \
-                    "${chosen_frag}"
-                make "${MAKE_FLAGS[@]}" olddefconfig
-                log_success "Fragment '${chosen_frag}' merged without damaging base configuration!"
+            if [[ ${#config_fragments[@]} -gt 0 ]]; then
+                echo -e "\nFound ${#config_fragments[@]} custom fragment file(s) in '${CONFIGS_DIR}':"
+                local i=1
+                for cfg in "${config_fragments[@]}"; do
+                    echo "  $((i))) $(basename "${cfg}") (${cfg})"
+                    i=$((i + 1))
+                done
+                echo ""
+                echo -en "${C_YELLOW}Select fragment number [1-${#config_fragments[@]}]: ${C_RESET}"
+                local sel
+                read -r sel || true
+                if [[ "${sel}" =~ ^[0-9]+$ ]] && [[ "${sel}" -ge 1 ]] && [[ "${sel}" -le ${#config_fragments[@]} ]]; then
+                    local chosen_frag="${config_fragments[$((sel - 1))]}"
+                    apply_config_fragment "${chosen_frag}"
+                else
+                    log_error "Invalid selection!"
+                fi
             else
-                log_error "Invalid selection!"
+                log_warn "Directory '${CONFIGS_DIR}' is empty."
             fi
-        fi
-    else
-        log_info "Directory '${CONFIGS_DIR}' is currently empty."
-        echo "You can place fragment files (e.g. lxc.config, debug.config, oc.config) into '${CONFIGS_DIR}'."
-        if prompt_confirm "Would you like to enter a custom config fragment path manually?" "N"; then
+            ;;
+        4)
             echo -en "${C_YELLOW}Enter absolute/relative path to config fragment: ${C_RESET}"
             local manual_cfg
             read -r manual_cfg || true
             if [[ -f "${manual_cfg}" ]]; then
-                log_info "Merging custom fragment: ${manual_cfg}..."
-                ARCH="${ARCH}" scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" \
-                    "${OUT_DIR}/.config" \
-                    "${manual_cfg}"
-                make "${MAKE_FLAGS[@]}" olddefconfig
-                log_success "Fragment merged successfully!"
+                apply_config_fragment "${manual_cfg}"
             else
                 log_error "File not found: ${manual_cfg}"
             fi
-        fi
-    fi
+            ;;
+        *)
+            log_error "Invalid selection!"
+            ;;
+    esac
 
     press_enter
 }
@@ -1196,6 +1247,80 @@ menu_apply_patch() {
 # ------------------------------------------------------------------------------
 # MENU 5: BUILD KERNEL
 # ------------------------------------------------------------------------------
+run_compile_kernel() {
+    local user_cores="$1"
+    local build_target="Image.gz-dtb"
+    user_cores="${user_cores:-$(nproc --all 2>/dev/null || echo 4)}"
+
+    # Initialize log file
+    {
+        echo "================================================================================"
+        echo "BUILD STARTED: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "DEVICE       : ${DEVICE} (${DEVICE_NAME})"
+        echo "BRANCH/COMMIT: $(git rev-parse --short HEAD 2>/dev/null || echo 'Unknown')"
+        echo "COMPILER     : $(${CC_COMPILER} --version 2>/dev/null | head -n1 || echo 'Clang/GCC')"
+        echo "THREADS      : ${user_cores}"
+        echo "================================================================================"
+    } > "${BUILD_LOG}"
+
+    local start_time
+    start_time=$(date +%s)
+
+    echo -e "${C_CYAN}Compilation in progress... Monitor output below or run 'tail -f ${BUILD_LOG}'${C_RESET}\n"
+
+    local build_success=0
+    # Execute make piping to tee with set -o pipefail
+    if make -j"${user_cores}" "${MAKE_FLAGS[@]}" "${build_target}" dtbs 2>&1 | tee -a "${BUILD_LOG}"; then
+        build_success=1
+    else
+        build_success=0
+    fi
+
+    local end_time
+    end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+    local el_min=$((elapsed / 60))
+    local el_sec=$((elapsed % 60))
+
+    echo ""
+    echo "================================================================================"
+    if [[ ${build_success} -eq 1 ]]; then
+        local target_image="${OUT_DIR}/arch/arm64/boot/Image.gz-dtb"
+        if [[ ! -f "${target_image}" ]]; then
+            # Fallback if Image.gz and dtb were built separately
+            if [[ -f "${OUT_DIR}/arch/arm64/boot/Image.gz" ]]; then
+                target_image="${OUT_DIR}/arch/arm64/boot/Image.gz"
+            elif [[ -f "${OUT_DIR}/arch/arm64/boot/Image" ]]; then
+                target_image="${OUT_DIR}/arch/arm64/boot/Image"
+            fi
+        fi
+
+        if [[ -f "${target_image}" ]]; then
+            local file_size
+            file_size=$(du -h "${target_image}" | cut -f1)
+            local sha256_hash
+            sha256_hash=$(sha256sum "${target_image}" | cut -d' ' -f1)
+
+            log_success "Kernel Compilation Succeeded!"
+            echo -e "  Output File  : ${C_GREEN}${target_image}${C_RESET}"
+            echo -e "  File Size    : ${C_WHITE}${file_size}${C_RESET}"
+            echo -e "  SHA256 Hash  : ${C_DIM}${sha256_hash}${C_RESET}"
+            echo -e "  Build Time   : ${C_YELLOW}${el_min}m ${el_sec}s${C_RESET}"
+            return 0
+        else
+            log_error "Compilation succeeded but kernel image was not found in ${OUT_DIR}/arch/arm64/boot/!"
+            return 1
+        fi
+    else
+        log_error "Kernel Compilation Failed! (Duration: ${el_min}m ${el_sec}s)"
+        echo -e "Please inspect the last 25 lines of '${BUILD_LOG}':"
+        echo "--------------------------------------------------------------------------------"
+        tail -n 25 "${BUILD_LOG}" || true
+        echo "--------------------------------------------------------------------------------"
+        return 1
+    fi
+}
+
 menu_build_kernel() {
     print_header
     echo -e "${C_BOLD}${C_BLUE}=== [5] Build Kernel ===${C_RESET}\n"
@@ -1255,71 +1380,7 @@ menu_build_kernel() {
         return 0
     fi
 
-    # Initialize log file
-    {
-        echo "================================================================================"
-        echo "BUILD STARTED: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "DEVICE       : ${DEVICE} (${DEVICE_NAME})"
-        echo "BRANCH/COMMIT: $(git rev-parse --short HEAD 2>/dev/null || echo 'Unknown')"
-        echo "COMPILER     : $(${CC_COMPILER} --version 2>/dev/null | head -n1 || echo 'Clang/GCC')"
-        echo "THREADS      : ${user_cores}"
-        echo "================================================================================"
-    } > "${BUILD_LOG}"
-
-    local start_time
-    start_time=$(date +%s)
-
-    echo -e "${C_CYAN}Compilation in progress... Monitor output below or run 'tail -f ${BUILD_LOG}'${C_RESET}\n"
-
-    local build_success=0
-    # Execute make piping to tee with set -o pipefail
-    if make -j"${user_cores}" "${MAKE_FLAGS[@]}" "${build_target}" dtbs 2>&1 | tee -a "${BUILD_LOG}"; then
-        build_success=1
-    else
-        build_success=0
-    fi
-
-    local end_time
-    end_time=$(date +%s)
-    local elapsed=$((end_time - start_time))
-    local el_min=$((elapsed / 60))
-    local el_sec=$((elapsed % 60))
-
-    echo ""
-    echo "================================================================================"
-    if [[ ${build_success} -eq 1 ]]; then
-        local target_image="${OUT_DIR}/arch/arm64/boot/Image.gz-dtb"
-        if [[ ! -f "${target_image}" ]]; then
-            # Fallback if Image.gz and dtb were built separately
-            if [[ -f "${OUT_DIR}/arch/arm64/boot/Image.gz" ]]; then
-                target_image="${OUT_DIR}/arch/arm64/boot/Image.gz"
-            elif [[ -f "${OUT_DIR}/arch/arm64/boot/Image" ]]; then
-                target_image="${OUT_DIR}/arch/arm64/boot/Image"
-            fi
-        fi
-
-        if [[ -f "${target_image}" ]]; then
-            local file_size
-            file_size=$(du -h "${target_image}" | cut -f1)
-            local sha256_hash
-            sha256_hash=$(sha256sum "${target_image}" | cut -d' ' -f1)
-
-            log_success "Kernel Compilation Succeeded!"
-            echo -e "  Output File  : ${C_GREEN}${target_image}${C_RESET}"
-            echo -e "  File Size    : ${C_WHITE}${file_size}${C_RESET}"
-            echo -e "  SHA256 Hash  : ${C_DIM}${sha256_hash}${C_RESET}"
-            echo -e "  Build Time   : ${C_YELLOW}${el_min}m ${el_sec}s${C_RESET}"
-        else
-            log_error "Compilation succeeded but kernel image was not found in ${OUT_DIR}/arch/arm64/boot/!"
-        fi
-    else
-        log_error "Kernel Compilation Failed! (Duration: ${el_min}m ${el_sec}s)"
-        echo -e "Please inspect the last 25 lines of '${BUILD_LOG}':"
-        echo "--------------------------------------------------------------------------------"
-        tail -n 25 "${BUILD_LOG}" || true
-        echo "--------------------------------------------------------------------------------"
-    fi
-
+    run_compile_kernel "${user_cores}"
     press_enter
 }
 
@@ -2085,8 +2146,91 @@ main_menu() {
 }
 
 # ------------------------------------------------------------------------------
+# CLI NON-INTERACTIVE MODE
+# ------------------------------------------------------------------------------
+cli_mode() {
+    load_config
+    setup_make_flags
+
+    local do_clean=0
+    local do_config=""
+    local do_nethunter=0
+    local do_build=0
+    local user_cores
+    user_cores="$(nproc --all 2>/dev/null || echo 4)"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --nethunter|-n)
+                do_nethunter=1
+                shift
+                ;;
+            --config|-c)
+                do_config="$2"
+                shift 2
+                ;;
+            --clean)
+                do_clean=1
+                shift
+                ;;
+            --build|-b)
+                do_build=1
+                if [[ -n "$2" && "$2" =~ ^[0-9]+$ ]]; then
+                    user_cores="$2"
+                    shift
+                fi
+                shift
+                ;;
+            --all|-a)
+                do_nethunter=1
+                do_build=1
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: $0 [options]"
+                echo "Options:"
+                echo "  -n, --nethunter          Apply Beryllium base + Kali NetHunter config"
+                echo "  -c, --config <fragment>  Apply custom config fragment (e.g. configs/nethunter.config)"
+                echo "  -b, --build [threads]    Compile kernel (Image.gz-dtb and dtbs)"
+                echo "  -a, --all                Apply NetHunter config and compile kernel"
+                echo "      --clean              Clean output directory before building"
+                echo "  -h, --help               Show this help message"
+                exit 0
+                ;;
+            *)
+                log_error "Unknown argument: $1"
+                echo "Use --help for usage information."
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ ${do_clean} -eq 1 ]]; then
+        log_info "Cleaning build directory (${OUT_DIR})..."
+        rm -rf "${OUT_DIR}"
+        mkdir -p "${OUT_DIR}"
+    fi
+
+    if [[ ${do_nethunter} -eq 1 ]]; then
+        apply_base_beryllium_config
+        apply_nethunter_config
+    elif [[ -n "${do_config}" ]]; then
+        apply_base_beryllium_config
+        apply_config_fragment "${do_config}"
+    fi
+
+    if [[ ${do_build} -eq 1 ]]; then
+        run_compile_kernel "${user_cores}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
 # ENTRY POINT
 # ------------------------------------------------------------------------------
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main_menu "$@"
+    if [[ $# -gt 0 ]]; then
+        cli_mode "$@"
+    else
+        main_menu
+    fi
 fi
