@@ -96,6 +96,7 @@ print_status_bar() {
     local cfg_status="${C_RED}Missing (.config)${C_RESET}"
     local img_status="${C_RED}Not Built${C_RESET}"
     local anyk_status="${C_YELLOW}Not Ready${C_RESET}"
+    local adb_status="${C_DIM}Not Connected${C_RESET}"
 
     if [[ -n "${ACTIVE_TOOLCHAIN_TYPE:-}" ]]; then
         tc_status="${C_GREEN}${ACTIVE_TOOLCHAIN_TYPE}${C_RESET}"
@@ -126,11 +127,41 @@ print_status_bar() {
         anyk_status="${C_GREEN}Installed${C_RESET}"
     fi
 
+    if command -v adb >/dev/null 2>&1; then
+        local dev_line
+        dev_line=$(adb devices 2>/dev/null | grep -E '\b(device|recovery|sideload|unauthorized)\b' | head -n1 || true)
+        if [[ -n "${dev_line}" ]]; then
+            local d_ser d_st
+            d_ser=$(echo "${dev_line}" | awk '{print $1}')
+            d_st=$(echo "${dev_line}" | awk '{print $2}')
+            case "${d_st}" in
+                device)
+                    adb_status="${C_GREEN}${d_ser} (online)${C_RESET}"
+                    ;;
+                recovery)
+                    adb_status="${C_CYAN}${d_ser} (recovery)${C_RESET}"
+                    ;;
+                sideload)
+                    adb_status="${C_YELLOW}${d_ser} (sideload)${C_RESET}"
+                    ;;
+                unauthorized)
+                    adb_status="${C_RED}${d_ser} (unauthorized)${C_RESET}"
+                    ;;
+                *)
+                    adb_status="${C_YELLOW}${d_ser} (${d_st})${C_RESET}"
+                    ;;
+            esac
+        fi
+    else
+        adb_status="${C_RED}ADB Not Found${C_RESET}"
+    fi
+
     echo -e "${C_WHITE}${C_BOLD}System Status:${C_RESET}"
     echo -e "  Toolchain  : ${tc_status}"
     echo -e "  Config     : ${cfg_status}"
     echo -e "  Image      : ${img_status}"
     echo -e "  AnyKernel3 : ${anyk_status}"
+    echo -e "  ADB Device : ${adb_status}"
     echo -e "${C_CYAN}--------------------------------------------------------------------------------${C_RESET}"
 }
 
@@ -650,6 +681,7 @@ menu_install_dependencies() {
                 "base-devel" "bc" "bison" "flex" "openssl" "make"
                 "zip" "curl" "git" "libelf" "ncurses" "python"
                 "ccache" "lld" "llvm" "clang" "aarch64-linux-gnu-binutils"
+                "android-tools"
             )
             echo -e "${C_CYAN}Checking system packages (Arch Linux / Pacman)...${C_RESET}\n"
             for pkg in "${packages[@]}"; do
@@ -667,6 +699,7 @@ menu_install_dependencies() {
                 "build-essential" "bc" "bison" "flex" "libssl-dev" "make"
                 "zip" "curl" "git" "libelf-dev" "libncurses-dev" "python3"
                 "ccache" "lld" "llvm" "clang" "binutils-aarch64-linux-gnu"
+                "adb"
             )
             echo -e "${C_CYAN}Checking system packages (Debian / Ubuntu / APT)...${C_RESET}\n"
             for pkg in "${packages[@]}"; do
@@ -832,71 +865,253 @@ menu_apply_config() {
 # ------------------------------------------------------------------------------
 # MENU 4: APPLY PATCH
 # ------------------------------------------------------------------------------
+apply_single_patch_file() {
+    local target_patch="$1"
+    local patch_name
+    patch_name="$(basename "${target_patch}")"
+
+    echo -e "\n${C_BOLD}${C_CYAN}--- Patch Details: ${patch_name} ---${C_RESET}"
+    echo "Path: ${target_patch}"
+
+    local status="CONFLICT"
+    if git apply --check "${target_patch}" >/dev/null 2>&1; then
+        status="CAN_APPLY"
+    elif git apply --reverse --check "${target_patch}" >/dev/null 2>&1; then
+        status="ALREADY_APPLIED"
+    elif git apply --ignore-whitespace --check "${target_patch}" >/dev/null 2>&1; then
+        status="CAN_APPLY_WHITESPACE"
+    elif git apply --3way --check "${target_patch}" >/dev/null 2>&1; then
+        status="CAN_APPLY_3WAY"
+    else
+        status="CONFLICT"
+    fi
+
+    echo -e "Dry-Run Status: ${C_YELLOW}${status}${C_RESET}\n"
+
+    case "${status}" in
+        CAN_APPLY)
+            if prompt_confirm "Apply patch '${patch_name}'?" "Y"; then
+                if git apply -v "${target_patch}"; then
+                    log_success "Patch applied successfully!"
+                else
+                    log_error "Failed to apply patch!"
+                fi
+            fi
+            ;;
+        CAN_APPLY_WHITESPACE)
+            echo -e "${C_CYAN}Notice: Patch has whitespace differences but can apply cleanly with --ignore-whitespace.${C_RESET}"
+            if prompt_confirm "Apply with '--ignore-whitespace'?" "Y"; then
+                if git apply --ignore-whitespace -v "${target_patch}"; then
+                    log_success "Patch applied successfully!"
+                else
+                    log_error "Failed to apply patch!"
+                fi
+            fi
+            ;;
+        CAN_APPLY_3WAY)
+            echo -e "${C_CYAN}Notice: Patch requires 3-way merge (--3way).${C_RESET}"
+            if prompt_confirm "Apply with '--3way'?" "Y"; then
+                if git apply --3way -v "${target_patch}"; then
+                    log_success "Patch applied successfully with 3-way merge!"
+                else
+                    log_error "Failed to apply patch with 3-way merge!"
+                fi
+            fi
+            ;;
+        ALREADY_APPLIED)
+            log_warn "This patch was detected as ALREADY APPLIED to the current working tree."
+            echo "Options:"
+            echo "  1) Revert patch (git apply -R)"
+            echo "  2) Cancel / Do nothing"
+            echo -en "${C_YELLOW}Select option [1-2, default 2]: ${C_RESET}"
+            local rev_choice
+            read -r rev_choice || true
+            if [[ "${rev_choice}" == "1" ]]; then
+                if git apply -R -v "${target_patch}"; then
+                    log_success "Patch reverted successfully!"
+                else
+                    log_error "Failed to revert patch!"
+                fi
+            fi
+            ;;
+        CONFLICT)
+            log_error "Dry-run check failed with CONFLICT!"
+            echo -e "${C_CYAN}Conflict details:${C_RESET}"
+            echo "--------------------------------------------------------------------------------"
+            git apply --check -v "${target_patch}" 2>&1 | head -n 25 || true
+            echo "--------------------------------------------------------------------------------"
+            echo ""
+            echo "Advanced Application Options:"
+            echo "  1) Try with 3-way merge (--3way)"
+            echo "  2) Try with ignore whitespace (--ignore-whitespace)"
+            echo "  3) Apply and output rejects (--reject)"
+            echo "  0) Cancel"
+            echo -en "${C_YELLOW}Select option [0-3]: ${C_RESET}"
+            local adv_choice
+            read -r adv_choice || true
+            case "${adv_choice}" in
+                1)
+                    if git apply --3way -v "${target_patch}"; then
+                        log_success "Patch applied with --3way!"
+                    else
+                        log_error "3-way merge failed!"
+                    fi
+                    ;;
+                2)
+                    if git apply --ignore-whitespace -v "${target_patch}"; then
+                        log_success "Patch applied with --ignore-whitespace!"
+                    else
+                        log_error "Failed with --ignore-whitespace!"
+                    fi
+                    ;;
+                3)
+                    if git apply --reject -v "${target_patch}"; then
+                        log_warn "Patch applied with rejects (*.rej files created)!"
+                    else
+                        log_error "Failed to apply with rejects!"
+                    fi
+                    ;;
+                *)
+                    log_info "Application cancelled."
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+import_nethunter_patches() {
+    local nh_dir="${KERNEL_DIR}/kali-nethunter-kernel-builder/patches/4.19"
+    if [[ ! -d "${nh_dir}" ]]; then
+        log_warn "Directory not found: ${nh_dir}"
+        return 0
+    fi
+
+    echo -e "\n${C_BOLD}${C_CYAN}--- Available Kali NetHunter 4.19 Patches ---${C_RESET}"
+    local nh_patches=()
+    while IFS= read -r -d '' f; do
+        nh_patches+=("${f}")
+    done < <(find "${nh_dir}" -maxdepth 1 -type f -name "*.patch" -print0 2>/dev/null | sort -z)
+
+    if [[ ${#nh_patches[@]} -eq 0 ]]; then
+        log_warn "No patch files found in ${nh_dir}"
+        return 0
+    fi
+
+    local i=1
+    for p in "${nh_patches[@]}"; do
+        printf "  %2d) %s\n" "${i}" "$(basename "${p}")"
+        i=$((i + 1))
+    done
+    echo "   a) Import ALL patches to ./patches/"
+    echo "   0) Cancel"
+    echo ""
+    echo -en "${C_YELLOW}Select patch to copy to ./patches/ [1-${#nh_patches[@]}, a, 0]: ${C_RESET}"
+    local c_sel
+    read -r c_sel || true
+
+    if [[ "${c_sel}" =~ ^[0-9]+$ ]] && [[ "${c_sel}" -ge 1 ]] && [[ "${c_sel}" -le ${#nh_patches[@]} ]]; then
+        local chosen_nh="${nh_patches[$((c_sel - 1))]}"
+        cp -v "${chosen_nh}" "${PATCHES_DIR}/"
+        log_success "Imported $(basename "${chosen_nh}") to ${PATCHES_DIR}/"
+    elif [[ "${c_sel}" =~ ^[aA]$ ]]; then
+        cp -v "${nh_patches[@]}" "${PATCHES_DIR}/"
+        log_success "Imported all ${#nh_patches[@]} NetHunter patches to ${PATCHES_DIR}/"
+    fi
+}
+
 menu_apply_patch() {
     print_header
     echo -e "${C_BOLD}${C_BLUE}=== [4] Apply Patch ===${C_RESET}\n"
 
     mkdir -p "${PATCHES_DIR}"
 
-    local patch_files=()
+    local raw_patches=()
     while IFS= read -r -d '' p; do
-        patch_files+=("${p}")
-    done < <(find "${PATCHES_DIR}" -maxdepth 1 -type f \( -name "*.patch" -o -name "*.diff" \) | sort -z 2>/dev/null || true)
+        raw_patches+=("${p}")
+    done < <(find "${PATCHES_DIR}" -type f \( -name "*.patch" -o -name "*.diff" \) -print0 2>/dev/null || true)
 
-    if [[ ${#patch_files[@]} -eq 0 ]]; then
-        log_warn "No *.patch or *.diff files found in '${PATCHES_DIR}'!"
-        echo -e "Please place your patches into the directory:\n  ${C_CYAN}${PATCHES_DIR}${C_RESET}"
-        press_enter
-        return 0
+    # Sort patches by file modification time (newest first)
+    local patch_files=()
+    if [[ ${#raw_patches[@]} -gt 0 ]]; then
+        while IFS= read -r file; do
+            [[ -n "${file}" && -f "${file}" ]] && patch_files+=("${file}")
+        done < <(stat -c "%Y %n" "${raw_patches[@]}" 2>/dev/null | sort -k1 -n -r | cut -d' ' -f2- || true)
     fi
 
-    echo -e "Scanning patch files and testing Dry-Run (Conflict Detection)...\n"
-    printf "${C_BOLD}%-4s %-42s %-20s${C_RESET}\n" "NO" "PATCH NAME" "DRY-RUN STATUS"
-    echo "--------------------------------------------------------------------------------"
-
     declare -a patch_status
-    local idx=0
 
-    for patch in "${patch_files[@]}"; do
-        local patch_name
-        patch_name="$(basename "${patch}")"
-        local status_str=""
+    if [[ ${#patch_files[@]} -gt 0 ]]; then
+        echo -e "Scanning patch files in '${PATCHES_DIR}' (Newest first)...\n"
+        printf "${C_BOLD}%-4s %-40s %-12s %-22s${C_RESET}\n" "NO" "PATCH NAME" "DATE" "STATUS"
+        echo "--------------------------------------------------------------------------------"
 
-        # Test dry-run with git apply --check
-        if git apply --check --verbose "${patch}" >/dev/null 2>&1; then
-            status_str="${C_GREEN}[ CAN APPLY ]${C_RESET}"
-            patch_status[idx]="CAN_APPLY"
-        elif git apply --reverse --check "${patch}" >/dev/null 2>&1; then
-            status_str="${C_YELLOW}[ ALREADY APPLIED ]${C_RESET}"
-            patch_status[idx]="ALREADY_APPLIED"
-        else
-            status_str="${C_RED}[ CONFLICT / FAILED ]${C_RESET}"
-            patch_status[idx]="CONFLICT"
-        fi
+        local idx=0
+        for patch in "${patch_files[@]}"; do
+            local patch_name
+            patch_name="$(basename "${patch}")"
+            local mod_date
+            mod_date=$(date -r "${patch}" "+%m-%d %H:%M" 2>/dev/null || echo "N/A")
+            local status_str=""
 
-        printf "%-4d %-42s %b\n" "$((idx + 1))" "${patch_name:0:40}" "${status_str}"
-        idx=$((idx + 1))
-    done
+            if git apply --check "${patch}" >/dev/null 2>&1; then
+                status_str="${C_GREEN}[ CAN APPLY ]${C_RESET}"
+                patch_status[idx]="CAN_APPLY"
+            elif git apply --reverse --check "${patch}" >/dev/null 2>&1; then
+                status_str="${C_YELLOW}[ ALREADY APPLIED ]${C_RESET}"
+                patch_status[idx]="ALREADY_APPLIED"
+            elif git apply --ignore-whitespace --check "${patch}" >/dev/null 2>&1; then
+                status_str="${C_CYAN}[ CAN APPLY (WS) ]${C_RESET}"
+                patch_status[idx]="CAN_APPLY_WHITESPACE"
+            elif git apply --3way --check "${patch}" >/dev/null 2>&1; then
+                status_str="${C_CYAN}[ CAN APPLY (3WAY) ]${C_RESET}"
+                patch_status[idx]="CAN_APPLY_3WAY"
+            else
+                status_str="${C_RED}[ CONFLICT / FAILED ]${C_RESET}"
+                patch_status[idx]="CONFLICT"
+            fi
 
-    echo "--------------------------------------------------------------------------------"
+            local tag=""
+            if [[ ${idx} -eq 0 ]]; then
+                tag=" ${C_GREEN}*NEW*${C_RESET}"
+            fi
+
+            printf "%-4d %-40s %-12s %b%b\n" "$((idx + 1))" "${patch_name:0:38}" "${mod_date}" "${status_str}" "${tag}"
+            idx=$((idx + 1))
+        done
+        echo "--------------------------------------------------------------------------------"
+    else
+        log_warn "No *.patch or *.diff files found in '${PATCHES_DIR}'!"
+        echo -e "Place your patches in '${PATCHES_DIR}' or use manual entry below."
+        echo "--------------------------------------------------------------------------------"
+    fi
+
     echo ""
     echo "Action Options:"
-    echo "  1) Apply All 'CAN APPLY' Patches"
-    echo "  2) Selectively Apply a Specific Patch"
-    echo "  3) Revert a Specific Patch (git apply -R)"
+    if [[ ${#patch_files[@]} -gt 0 ]]; then
+        echo "  1) Apply All 'CAN APPLY' Patches"
+        echo "  2) Selectively Apply / Inspect a Specific Patch [1-${#patch_files[@]}]"
+        echo "  3) Revert a Specific Patch (git apply -R)"
+    fi
+    echo "  4) Apply Custom Patch from Manual File Path"
+    if [[ -d "${KERNEL_DIR}/kali-nethunter-kernel-builder/patches/4.19" ]]; then
+        echo "  5) Browse & Import Patches from Kali NetHunter (4.19)"
+    fi
     echo "  0) Return to Main Menu"
     echo ""
-    echo -en "${C_YELLOW}Select option [0-3]: ${C_RESET}"
+    echo -en "${C_YELLOW}Select option: ${C_RESET}"
     local patch_choice
     read -r patch_choice || true
 
     case "${patch_choice}" in
         1)
-            if prompt_confirm "Confirmation: Apply all patches that passed dry-run?" "Y"; then
+            if [[ ${#patch_files[@]} -eq 0 ]]; then
+                log_error "No patches available to apply!"
+            else
                 local applied_count=0
                 for i in "${!patch_files[@]}"; do
-                    if [[ "${patch_status[i]}" == "CAN_APPLY" ]]; then
-                        local p_file="${patch_files[i]}"
+                    local st="${patch_status[i]}"
+                    local p_file="${patch_files[i]}"
+                    if [[ "${st}" == "CAN_APPLY" ]]; then
                         log_info "Applying: $(basename "${p_file}")..."
                         if git apply -v "${p_file}"; then
                             log_success "Applied: $(basename "${p_file}")"
@@ -904,31 +1119,29 @@ menu_apply_patch() {
                         else
                             log_error "Failed to apply: $(basename "${p_file}")"
                         fi
+                    elif [[ "${st}" == "CAN_APPLY_WHITESPACE" ]]; then
+                        log_info "Applying (ignore whitespace): $(basename "${p_file}")..."
+                        if git apply --ignore-whitespace -v "${p_file}"; then
+                            log_success "Applied: $(basename "${p_file}")"
+                            applied_count=$((applied_count + 1))
+                        fi
+                    elif [[ "${st}" == "CAN_APPLY_3WAY" ]]; then
+                        log_info "Applying (3-way merge): $(basename "${p_file}")..."
+                        if git apply --3way -v "${p_file}"; then
+                            log_success "Applied: $(basename "${p_file}")"
+                            applied_count=$((applied_count + 1))
+                        fi
                     fi
                 done
                 log_success "Complete! Total ${applied_count} patch(es) applied."
             fi
             ;;
         2)
-            echo -en "${C_YELLOW}Enter patch number to apply [1-${#patch_files[@]}]: ${C_RESET}"
+            echo -en "${C_YELLOW}Enter patch number to apply/inspect [1-${#patch_files[@]}]: ${C_RESET}"
             local p_idx
             read -r p_idx || true
             if [[ "${p_idx}" =~ ^[0-9]+$ ]] && [[ "${p_idx}" -ge 1 ]] && [[ "${p_idx}" -le ${#patch_files[@]} ]]; then
-                local target_patch="${patch_files[$((p_idx - 1))]}"
-                local current_st="${patch_status[$((p_idx - 1))]}"
-                if [[ "${current_st}" == "CONFLICT" ]]; then
-                    log_error "Dry-run failed with conflict! Application aborted to preserve repository integrity."
-                elif [[ "${current_st}" == "ALREADY_APPLIED" ]]; then
-                    log_warn "This patch was detected as already applied."
-                else
-                    if prompt_confirm "Apply $(basename "${target_patch}")?" "Y"; then
-                        if git apply -v "${target_patch}"; then
-                            log_success "Patch applied successfully!"
-                        else
-                            log_error "Application failed!"
-                        fi
-                    fi
-                fi
+                apply_single_patch_file "${patch_files[$((p_idx - 1))]}"
             else
                 log_error "Invalid patch number!"
             fi
@@ -946,13 +1159,34 @@ menu_apply_patch() {
                         log_error "Failed to revert patch!"
                     fi
                 fi
+            else
+                log_error "Invalid patch number!"
             fi
+            ;;
+        4)
+            echo -en "${C_YELLOW}Enter absolute/relative path to patch file: ${C_RESET}"
+            local manual_p
+            read -r manual_p || true
+            if [[ -f "${manual_p}" ]]; then
+                local real_p
+                real_p="$(realpath "${manual_p}")"
+                if prompt_confirm "Copy this patch to ${PATCHES_DIR}/ for future runs?" "Y"; then
+                    cp "${real_p}" "${PATCHES_DIR}/"
+                    log_success "Copied to ${PATCHES_DIR}/$(basename "${real_p}")"
+                fi
+                apply_single_patch_file "${real_p}"
+            else
+                log_error "File not found: ${manual_p}"
+            fi
+            ;;
+        5)
+            import_nethunter_patches
             ;;
         0)
             return 0
             ;;
         *)
-            log_error "Unknown selection!"
+            log_error "Invalid selection!"
             ;;
     esac
 
@@ -1162,7 +1396,7 @@ device.name2=Beryllium
 device.name3=POCO F1
 device.name4=Pocophone F1
 device.name5=Poco F1
-supported.versions=9 - 15
+supported.versions=
 supported.patchlevels=
 supported.vendorpatchlevels=
 '; } # end properties
@@ -1242,11 +1476,521 @@ EOF
         echo -e "  SHA256 Hash    : ${C_DIM}${zip_sha}${C_RESET}"
         echo "================================================================================"
         echo -e "${C_CYAN}This flashable zip is ready to be flashed via TWRP / OrangeFox Recovery on Pocophone F1.${C_RESET}"
+
+        echo ""
+        if prompt_confirm "Would you like to flash this AnyKernel package now via ADB?" "Y"; then
+            flash_anykernel_package "${zip_target}"
+            return 0
+        fi
     else
         log_error "Failed to create flashable zip archive!"
     fi
 
     press_enter
+}
+
+# ------------------------------------------------------------------------------
+# MENU 7: FLASH ANYKERNEL VIA ADB (LIVE ANDROID / RECOVERY)
+# ------------------------------------------------------------------------------
+SELECTED_ADB_SERIAL=""
+SELECTED_ADB_STATE=""
+SELECTED_ADB_MODEL=""
+SELECTED_ADB_CODENAME=""
+SELECTED_ANYKERNEL_ZIP=""
+
+detect_adb_device() {
+    SELECTED_ADB_SERIAL=""
+    SELECTED_ADB_STATE=""
+    SELECTED_ADB_MODEL=""
+    SELECTED_ADB_CODENAME=""
+
+    if ! command -v adb >/dev/null 2>&1; then
+        log_error "ADB command not found on this system!"
+        log_warn "Please install 'android-tools' (Arch) or 'adb' (Debian/Ubuntu) in Menu [2]."
+        return 1
+    fi
+
+    log_info "Scanning for connected ADB devices..."
+    adb start-server >/dev/null 2>&1 || true
+
+    local raw_devs=()
+    while IFS= read -r line; do
+        if [[ -n "${line}" && ! "${line}" =~ ^List ]]; then
+            raw_devs+=("${line}")
+        fi
+    done < <(adb devices 2>/dev/null || true)
+
+    if [[ ${#raw_devs[@]} -eq 0 ]]; then
+        log_warn "No ADB devices detected!"
+        echo -e "${C_YELLOW}Please connect your Pocophone F1 via USB with 'USB Debugging' enabled.${C_RESET}"
+        echo ""
+        echo "  1) Retry ADB detection"
+        echo "  2) Wait for device to connect (adb wait-for-device)"
+        echo "  0) Cancel and return"
+        echo ""
+        echo -en "${C_YELLOW}Select option [0-2]: ${C_RESET}"
+        local retry_choice
+        read -r retry_choice || true
+        case "${retry_choice}" in
+            1)
+                detect_adb_device
+                return $?
+                ;;
+            2)
+                log_info "Waiting for device to connect... (Press Ctrl+C to abort)"
+                if adb wait-for-device; then
+                    detect_adb_device
+                    return $?
+                else
+                    return 1
+                fi
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    fi
+
+    local chosen_entry=""
+    if [[ ${#raw_devs[@]} -eq 1 ]]; then
+        chosen_entry="${raw_devs[0]}"
+    else
+        echo -e "\n${C_CYAN}Multiple ADB devices detected. Select target device:${C_RESET}"
+        local idx=1
+        for dev in "${raw_devs[@]}"; do
+            echo "  ${idx}) ${dev}"
+            idx=$((idx + 1))
+        done
+        echo "  0) Cancel"
+        echo ""
+        echo -en "${C_YELLOW}Select device [1-${#raw_devs[@]}]: ${C_RESET}"
+        local sel
+        read -r sel || true
+        if [[ "${sel}" =~ ^[0-9]+$ ]] && [[ "${sel}" -ge 1 ]] && [[ "${sel}" -le ${#raw_devs[@]} ]]; then
+            chosen_entry="${raw_devs[$((sel - 1))]}"
+        else
+            log_error "Invalid device selection!"
+            return 1
+        fi
+    fi
+
+    SELECTED_ADB_SERIAL=$(echo "${chosen_entry}" | awk '{print $1}')
+    SELECTED_ADB_STATE=$(echo "${chosen_entry}" | awk '{print $2}')
+
+    if [[ "${SELECTED_ADB_STATE}" == "unauthorized" ]]; then
+        log_error "Device '${SELECTED_ADB_SERIAL}' is UNAUTHORIZED!"
+        echo -e "${C_YELLOW}Please check your phone screen and allow USB debugging (check 'Always allow').${C_RESET}"
+        if prompt_confirm "Retry connection after authorizing on phone?" "Y"; then
+            detect_adb_device
+            return $?
+        else
+            return 1
+        fi
+    fi
+
+    if [[ "${SELECTED_ADB_STATE}" == "offline" ]]; then
+        log_error "Device '${SELECTED_ADB_SERIAL}' is OFFLINE!"
+        log_warn "Please reconnect the USB cable or run 'adb kill-server'."
+        return 1
+    fi
+
+    if [[ "${SELECTED_ADB_STATE}" == "device" ]]; then
+        SELECTED_ADB_MODEL=$(adb -s "${SELECTED_ADB_SERIAL}" shell getprop ro.product.model 2>/dev/null | tr -d '\r\n' || true)
+        SELECTED_ADB_CODENAME=$(adb -s "${SELECTED_ADB_SERIAL}" shell getprop ro.product.device 2>/dev/null | tr -d '\r\n' || true)
+        if [[ -z "${SELECTED_ADB_CODENAME}" ]]; then
+            SELECTED_ADB_CODENAME=$(adb -s "${SELECTED_ADB_SERIAL}" shell getprop ro.build.product 2>/dev/null | tr -d '\r\n' || true)
+        fi
+    fi
+
+    log_success "ADB Device Connected: ${C_GREEN}${SELECTED_ADB_SERIAL}${C_RESET} [State: ${SELECTED_ADB_STATE}]"
+    if [[ -n "${SELECTED_ADB_MODEL}" ]]; then
+        echo -e "  Device Model   : ${C_GREEN}${SELECTED_ADB_MODEL}${C_RESET} (${SELECTED_ADB_CODENAME:-unknown})"
+    fi
+
+    return 0
+}
+
+select_anykernel_zip() {
+    SELECTED_ANYKERNEL_ZIP=""
+
+    local zip_candidates=()
+    while IFS= read -r -d '' z; do
+        zip_candidates+=("${z}")
+    done < <(find "${RELEASE_DIR}" "${ANYKERNEL_DIR}" -maxdepth 1 -type f -name "*.zip" -print0 2>/dev/null || true)
+
+    local sorted_zips=()
+    if [[ ${#zip_candidates[@]} -gt 0 ]]; then
+        while IFS= read -r file; do
+            [[ -n "${file}" && -f "${file}" ]] && sorted_zips+=("${file}")
+        done < <(stat -c "%Y %n" "${zip_candidates[@]}" 2>/dev/null | sort -k1 -n -r | cut -d' ' -f2- || true)
+    fi
+
+    if [[ ${#sorted_zips[@]} -eq 0 ]]; then
+        log_warn "No AnyKernel zip archives found in '${RELEASE_DIR}' or '${ANYKERNEL_DIR}'!"
+        echo ""
+        echo "Options:"
+        echo "  1) Package current build to AnyKernel now (Menu [6])"
+        echo "  2) Specify custom zip file path manually"
+        echo "  0) Cancel / Return to Main Menu"
+        echo ""
+        echo -en "${C_YELLOW}Select option [0-2]: ${C_RESET}"
+        local no_z_choice
+        read -r no_z_choice || true
+        case "${no_z_choice}" in
+            1)
+                menu_setup_anykernel
+                select_anykernel_zip
+                return $?
+                ;;
+            2)
+                echo -en "${C_YELLOW}Enter path to AnyKernel zip: ${C_RESET}"
+                local manual_zip
+                read -r manual_zip || true
+                if [[ -f "${manual_zip}" ]]; then
+                    SELECTED_ANYKERNEL_ZIP="$(realpath "${manual_zip}")"
+                    return 0
+                else
+                    log_error "File not found: ${manual_zip}"
+                    return 1
+                fi
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    fi
+
+    echo -e "${C_CYAN}Select AnyKernel Package to Flash:${C_RESET}"
+    local idx=1
+    for z in "${sorted_zips[@]}"; do
+        local sz mod_time
+        sz=$(du -h "${z}" | cut -f1)
+        mod_time=$(date -r "${z}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "N/A")
+        local tag=""
+        if [[ ${idx} -eq 1 ]]; then
+            tag=" ${C_GREEN}[LATEST]${C_RESET}"
+        fi
+        printf "  %2d) %-42s (%6s) [%s]%b\n" "${idx}" "$(basename "${z}")" "${sz}" "${mod_time}" "${tag}"
+        idx=$((idx + 1))
+    done
+    echo "   m) Enter custom zip path manually"
+    echo "   0) Cancel / Return"
+    echo ""
+    echo -en "${C_YELLOW}Select package [1-${#sorted_zips[@]}, default: 1]: ${C_RESET}"
+    local zip_choice
+    read -r zip_choice || true
+    zip_choice="${zip_choice:-1}"
+
+    if [[ "${zip_choice}" =~ ^[0-9]+$ ]] && [[ "${zip_choice}" -ge 1 ]] && [[ "${zip_choice}" -le ${#sorted_zips[@]} ]]; then
+        SELECTED_ANYKERNEL_ZIP="${sorted_zips[$((zip_choice - 1))]}"
+    elif [[ "${zip_choice}" =~ ^[mM]$ ]]; then
+        echo -en "${C_YELLOW}Enter path to AnyKernel zip: ${C_RESET}"
+        local manual_zip
+        read -r manual_zip || true
+        if [[ -f "${manual_zip}" ]]; then
+            SELECTED_ANYKERNEL_ZIP="$(realpath "${manual_zip}")"
+        else
+            log_error "File not found: ${manual_zip}"
+            return 1
+        fi
+    elif [[ "${zip_choice}" == "0" ]]; then
+        return 1
+    else
+        log_error "Invalid selection!"
+        return 1
+    fi
+
+    if command -v unzip >/dev/null 2>&1; then
+        if ! unzip -tq "${SELECTED_ANYKERNEL_ZIP}" >/dev/null 2>&1; then
+            log_error "Zip archive validation failed: '${SELECTED_ANYKERNEL_ZIP}' is corrupted!"
+            return 1
+        fi
+    fi
+
+    log_success "Selected Zip: $(basename "${SELECTED_ANYKERNEL_ZIP}")"
+    return 0
+}
+
+flash_via_adb_shell() {
+    local serial="$1"
+    local zip_path="$2"
+
+    echo -e "\n${C_BOLD}${C_CYAN}=== Automated Live Android Flash (ADB Shell) ===${C_RESET}\n"
+
+    local android_ver curr_kernel codename model
+    android_ver=$(adb -s "${serial}" shell getprop ro.build.version.release 2>/dev/null | tr -d '\r\n' || echo "Unknown")
+    curr_kernel=$(adb -s "${serial}" shell uname -r 2>/dev/null | tr -d '\r\n' || echo "Unknown")
+    codename=$(adb -s "${serial}" shell getprop ro.product.device 2>/dev/null | tr -d '\r\n' || true)
+    [[ -z "${codename}" ]] && codename=$(adb -s "${serial}" shell getprop ro.build.product 2>/dev/null | tr -d '\r\n' || echo "Unknown")
+    model=$(adb -s "${serial}" shell getprop ro.product.model 2>/dev/null | tr -d '\r\n' || echo "Unknown")
+
+    echo -e "Device Environment:"
+    echo -e "  Device Model       : ${C_GREEN}${model}${C_RESET} (${codename})"
+    echo -e "  Android Version    : ${C_GREEN}Android ${android_ver}${C_RESET}"
+    echo -e "  Current Kernel     : ${C_YELLOW}${curr_kernel}${C_RESET}"
+    echo -e "  Target Package     : ${C_WHITE}$(basename "${zip_path}")${C_RESET}"
+    echo ""
+
+    if [[ "${codename}" != "Unknown" && "${codename}" != "beryllium" && "${codename}" != "Beryllium" ]]; then
+        log_warn "Detected device codename '${codename}' does not match '${DEVICE}'!"
+        if ! prompt_confirm "Flashing the wrong kernel can softbrick the device. Continue anyway?" "N"; then
+            log_info "Flashing cancelled by user."
+            return 1
+        fi
+    fi
+
+    log_info "Verifying root access for live kernel flashing..."
+    local use_su=0
+    local root_ok=0
+
+    adb -s "${serial}" root 2>/dev/null || true
+    sleep 1
+    local uid_check
+    uid_check=$(adb -s "${serial}" shell id -u 2>/dev/null | tr -d '\r\n' || echo "2000")
+    if [[ "${uid_check}" == "0" ]]; then
+        log_success "Root access granted via adbd root (uid 0)!"
+        use_su=0
+        root_ok=1
+    else
+        log_info "Testing Superuser ('su') access..."
+        echo -e "${C_DIM}If prompted on your phone, please GRANT root permission to Shell.${C_RESET}"
+        local su_check
+        su_check=$(adb -s "${serial}" shell "su -c 'id -u'" 2>/dev/null | tr -d '\r\n' || echo "fail")
+        if [[ "${su_check}" == "0" ]]; then
+            log_success "Root access granted via 'su' (Magisk / KernelSU / APatch)!"
+            use_su=1
+            root_ok=1
+        fi
+    fi
+
+    if [[ "${root_ok}" -ne 1 ]]; then
+        log_error "Root permissions (su or adb root) could not be obtained!"
+        echo -e "${C_YELLOW}Direct live flashing while Android is running requires root access to write /dev/block/bootdevice/by-name/boot.${C_RESET}"
+        echo ""
+        echo "Options:"
+        echo "  1) Reboot device to Recovery (TWRP / OrangeFox) and flash there (Recommended without root)"
+        echo "  2) Retry root check (if you just approved the prompt on your phone)"
+        echo "  0) Cancel"
+        echo ""
+        echo -en "${C_YELLOW}Select option [0-2]: ${C_RESET}"
+        local no_root_choice
+        read -r no_root_choice || true
+        case "${no_root_choice}" in
+            1)
+                log_info "Rebooting device to Recovery mode..."
+                adb -s "${serial}" reboot recovery
+                log_info "Waiting for device to enter recovery mode..."
+                adb -s "${serial}" wait-for-recovery 2>/dev/null || sleep 12
+                flash_via_recovery "${serial}" "${zip_path}"
+                return $?
+                ;;
+            2)
+                flash_via_adb_shell "${serial}" "${zip_path}"
+                return $?
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    fi
+
+    if ! prompt_confirm "Ready to flash kernel to boot partition via ADB shell. Proceed?" "Y"; then
+        log_info "Flash aborted by user."
+        return 1
+    fi
+
+    local host_tmp dev_tmp dev_ws dev_bin
+    host_tmp=$(mktemp -d /tmp/ak3_live_flash_XXXXXX)
+    dev_tmp="/data/local/tmp/ak3_flash"
+    dev_ws="/data/local/tmp/ak3_workspace"
+    dev_bin="/data/local/tmp/ak3_bin"
+
+    log_info "Unpacking AnyKernel package on host..."
+    unzip -q "${zip_path}" -d "${host_tmp}"
+
+    # Patch live installer on host:
+    # 1. Remove version constraint so Android 9 - 17+ are fully supported
+    sed -i 's/^supported.versions=.*/supported.versions=/' "${host_tmp}/anykernel.sh" 2>/dev/null || true
+    # 2. Fix /proc/self/fd/1 error when running via su / adb shell by removing >> /proc/self/fd/$OUTFD
+    sed -i 's/>> \/proc\/self\/fd\/$OUTFD//g' "${host_tmp}/META-INF/com/google/android/update-binary" 2>/dev/null || true
+    sed -i 's/>> \/proc\/self\/fd\/$OUTFD//g' "${host_tmp}/tools/ak3-core.sh" 2>/dev/null || true
+
+    # Create temporary live-flash zip so AnyKernel's internal unzip also receives the patched files
+    (
+        cd "${host_tmp}"
+        zip -q -r "${host_tmp}/anykernel_live.zip" ./* -x "anykernel_live.zip" "run_flash.sh"
+    )
+
+    log_info "Preparing temporary workspaces on device..."
+    adb -s "${serial}" shell "rm -rf ${dev_tmp} ${dev_ws} ${dev_bin} 2>/dev/null || true"
+    adb -s "${serial}" shell "mkdir -p ${dev_tmp} ${dev_ws} ${dev_bin}"
+
+    log_info "Pushing AnyKernel archive to device (${dev_tmp}/anykernel.zip)..."
+    adb -s "${serial}" push "${host_tmp}/anykernel_live.zip" "${dev_tmp}/anykernel.zip"
+
+    log_info "Pushing installer files to device workspace (${dev_ws}/)..."
+    adb -s "${serial}" push "${host_tmp}/." "${dev_ws}/" >/dev/null 2>&1
+
+    log_info "Configuring execution permissions & standalone tools..."
+    adb -s "${serial}" shell "chmod -R 755 ${dev_ws}/tools ${dev_ws}/anykernel.sh ${dev_ws}/META-INF/com/google/android/update-binary 2>/dev/null || true"
+    adb -s "${serial}" shell "cp ${dev_ws}/tools/busybox ${dev_bin}/busybox 2>/dev/null && chmod 755 ${dev_bin}/busybox && ln -sf ${dev_bin}/busybox ${dev_bin}/unzip 2>/dev/null || true"
+
+    cat << 'EOF' > "${host_tmp}/run_flash.sh"
+#!/system/bin/sh
+set -e
+export AKHOME="/data/local/tmp/ak3_workspace"
+export ZIPFILE="/data/local/tmp/ak3_flash/anykernel.zip"
+export PATH="/data/local/tmp/ak3_bin:$AKHOME/tools:$AKHOME/bin:/system/bin:/vendor/bin:$PATH"
+
+cd "$AKHOME"
+chmod 755 tools/* 2>/dev/null || true
+chmod 755 anykernel.sh 2>/dev/null || true
+
+if [ -f "META-INF/com/google/android/update-binary" ]; then
+    chmod 755 META-INF/com/google/android/update-binary 2>/dev/null || true
+    sh META-INF/com/google/android/update-binary 3 1 "$ZIPFILE"
+elif [ -f "anykernel.sh" ]; then
+    ash anykernel.sh
+else
+    echo "Error: AnyKernel installer script not found!"
+    exit 1
+fi
+EOF
+
+    adb -s "${serial}" push "${host_tmp}/run_flash.sh" "${dev_tmp}/run_flash.sh" >/dev/null 2>&1
+    adb -s "${serial}" shell "chmod 755 ${dev_tmp}/run_flash.sh"
+
+    local exec_cmd="sh ${dev_tmp}/run_flash.sh"
+    if [[ "${use_su}" -eq 1 ]]; then
+        exec_cmd="su -c 'sh ${dev_tmp}/run_flash.sh'"
+    fi
+
+    log_info "Executing AnyKernel3 installer in ADB Shell..."
+    echo -e "${C_CYAN}------------------------ [ ADB Flasher Output ] ------------------------${C_RESET}"
+
+    local flash_log="${host_tmp}/flash_exec.log"
+    local flash_failed=0
+
+    adb -s "${serial}" shell "${exec_cmd}" 2>&1 | tee "${flash_log}" | while IFS= read -r raw_line; do
+        local line
+        line=$(echo "${raw_line}" | sed -e 's/^ui_print //' -e 's/^ui_print$//' -e $'s/\r$//')
+        if [[ -n "${line}" ]]; then
+            echo -e "  ${C_CYAN}│${C_RESET} ${line}"
+        fi
+    done || flash_failed=1
+
+    echo -e "${C_CYAN}------------------------------------------------------------------------${C_RESET}\n"
+
+    adb -s "${serial}" shell "rm -rf ${dev_tmp} ${dev_ws} ${dev_bin} 2>/dev/null || true"
+    rm -rf "${host_tmp}"
+
+    if grep -qi "abort" "${flash_log}" 2>/dev/null || [[ ${flash_failed} -ne 0 ]]; then
+        log_error "Flashing process encountered errors or was aborted!"
+        return 1
+    fi
+
+    log_success "Kernel successfully installed to boot partition via ADB Shell!"
+    echo -e "${C_GREEN}${C_BOLD}Flashing Complete!${C_RESET}\n"
+
+    if prompt_confirm "Would you like to reboot the device now to activate the new kernel?" "Y"; then
+        log_info "Rebooting device..."
+        adb -s "${serial}" reboot
+        log_success "Device reboot command sent. Your Pocophone F1 is restarting!"
+    fi
+
+    return 0
+}
+
+flash_via_recovery() {
+    local serial="$1"
+    local zip_path="$2"
+
+    echo -e "\n${C_BOLD}${C_CYAN}=== Recovery Flashing (TWRP / OrangeFox) ===${C_RESET}\n"
+    log_info "Target Zip: $(basename "${zip_path}")"
+
+    local rec_zip="/tmp/anykernel.zip"
+    log_info "Pushing AnyKernel package to recovery (${rec_zip})..."
+    adb -s "${serial}" push "${zip_path}" "${rec_zip}"
+
+    log_info "Triggering installation in recovery..."
+    if adb -s "${serial}" shell "command -v twrp >/dev/null 2>&1"; then
+        echo -e "${C_CYAN}Running: twrp install ${rec_zip}...${C_RESET}"
+        adb -s "${serial}" shell "twrp install ${rec_zip}" 2>&1 | while IFS= read -r l; do
+            echo -e "  ${C_CYAN}│${C_RESET} $(echo "${l}" | tr -d '\r')"
+        done
+    else
+        log_info "TWRP CLI command not found, using OpenRecoveryScript fallback..."
+        adb -s "${serial}" shell "echo 'install ${rec_zip}' > /cache/recovery/openrecoveryscript 2>/dev/null || echo 'install ${rec_zip}' > /tmp/openrecoveryscript"
+        log_info "Queued installation via OpenRecoveryScript."
+    fi
+
+    log_success "Recovery flash instructions dispatched!"
+    if prompt_confirm "Reboot device to System now?" "Y"; then
+        adb -s "${serial}" reboot
+        log_success "Rebooting to system..."
+    fi
+    return 0
+}
+
+flash_via_sideload() {
+    local serial="$1"
+    local zip_path="$2"
+
+    echo -e "\n${C_BOLD}${C_CYAN}=== ADB Sideload Mode ===${C_RESET}\n"
+    log_info "Sending AnyKernel package via ADB sideload..."
+    if adb -s "${serial}" sideload "${zip_path}"; then
+        log_success "ADB sideload completed successfully!"
+        if prompt_confirm "Reboot system now?" "Y"; then
+            adb -s "${serial}" reboot
+        fi
+        return 0
+    else
+        log_error "ADB sideload failed!"
+        return 1
+    fi
+}
+
+flash_anykernel_package() {
+    local preselected_zip="${1:-}"
+
+    if ! detect_adb_device; then
+        press_enter
+        return 0
+    fi
+
+    local target_zip=""
+    if [[ -n "${preselected_zip}" && -f "${preselected_zip}" ]]; then
+        target_zip="${preselected_zip}"
+    else
+        if ! select_anykernel_zip; then
+            press_enter
+            return 0
+        fi
+        target_zip="${SELECTED_ANYKERNEL_ZIP}"
+    fi
+
+    case "${SELECTED_ADB_STATE}" in
+        device)
+            flash_via_adb_shell "${SELECTED_ADB_SERIAL}" "${target_zip}"
+            ;;
+        recovery)
+            flash_via_recovery "${SELECTED_ADB_SERIAL}" "${target_zip}"
+            ;;
+        sideload)
+            flash_via_sideload "${SELECTED_ADB_SERIAL}" "${target_zip}"
+            ;;
+        *)
+            log_error "Unsupported device state: ${SELECTED_ADB_STATE}"
+            ;;
+    esac
+
+    press_enter
+}
+
+menu_flash_anykernel() {
+    print_header
+    echo -e "${C_BOLD}${C_BLUE}=== [7] Flash AnyKernel via ADB (Live Android / Recovery) ===${C_RESET}\n"
+    flash_anykernel_package
 }
 
 # ------------------------------------------------------------------------------
@@ -1288,11 +2032,12 @@ main_menu() {
         echo -e "  ${C_CYAN}4.${C_RESET} Apply Patch"
         echo -e "  ${C_CYAN}5.${C_RESET} Build Kernel"
         echo -e "  ${C_CYAN}6.${C_RESET} Setup and Pack to AnyKernel"
+        echo -e "  ${C_CYAN}7.${C_RESET} Flash AnyKernel via ADB (Live Android / Recovery)"
         echo ""
         echo -e "  ${C_DIM}c. Clean Build Artifacts (out / log)${C_RESET}"
         echo -e "  ${C_DIM}q. Exit${C_RESET}"
         echo ""
-        echo -en "${C_YELLOW}Select menu option [0-6, c, q]: ${C_RESET}"
+        echo -en "${C_YELLOW}Select menu option [0-7, c, q]: ${C_RESET}"
 
         local main_choice
         read -r main_choice || true
@@ -1319,6 +2064,9 @@ main_menu() {
             6)
                 menu_setup_anykernel
                 ;;
+            7)
+                menu_flash_anykernel
+                ;;
             c|C)
                 clean_artifacts
                 ;;
@@ -1329,7 +2077,7 @@ main_menu() {
                 exit 0
                 ;;
             *)
-                log_error "Invalid selection! Please enter a number 0-6, c, or q."
+                log_error "Invalid selection! Please enter a number 0-7, c, or q."
                 sleep 1
                 ;;
         esac
