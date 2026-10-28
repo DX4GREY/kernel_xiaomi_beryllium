@@ -139,3 +139,25 @@ kernel/configs/android-*.cfg
 #Ignoring Android.bp link file
 #
 Android.bp
+
+#
+# Build environment, toolchains, logs and artifacts
+#
+*.orig
+*.rej
+*.log
+/out/
+/build_output/
+/toolchain/
+/AnyKernel3/
+/kali-nethunter-kernel-builder/
+builder.conf
+/scripts/min-tool-version.sh
+
+#
+# Allow custom patches and configs directories
+#
+!/patches/
+!/patches/**
+!/configs/
+!/configs/**
