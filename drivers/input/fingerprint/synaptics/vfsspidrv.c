@@ -820,7 +820,7 @@ static int vfsspi_sendDrdyNotify(struct vfsspi_devData *vfsSpiDev)
 			goto cleanup;
 		}
 
-		efd_file = fcheck_files(t->files, vfsSpiDev->drdySignalID);
+		efd_file = files_lookup_fd_rcu(t->files, vfsSpiDev->drdySignalID);
 		rcu_read_unlock();
 
 		if (efd_file == NULL) {
@@ -870,7 +870,7 @@ static int vfsspi_sendHbmReqNotify(struct vfsspi_devData *vfsSpiDev)
 			goto cleanup;
 		}
 
-		efd_file = fcheck_files(t->files, vfsSpiDev->hbmReqSignalID);
+		efd_file = files_lookup_fd_rcu(t->files, vfsSpiDev->hbmReqSignalID);
 		rcu_read_unlock();
 
 		if (efd_file == NULL) {
