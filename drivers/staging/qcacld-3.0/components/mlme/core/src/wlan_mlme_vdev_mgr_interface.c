@@ -26,6 +26,7 @@
 #include <include/wlan_mlme_cmn.h>
 #include <../../core/src/vdev_mgr_ops.h>
 #include "wlan_psoc_mlme_api.h"
+#include "wlan_vdev_mlme_api.h"
 #include "wlan_crypto_global_api.h"
 
 static struct vdev_mlme_ops sta_mlme_ops;
@@ -1165,7 +1166,7 @@ static QDF_STATUS mon_mlme_vdev_disconnect_peers(
 {
 	mlme_legacy_debug("vdev id = %d",
 			  vdev_mlme->vdev->vdev_objmgr.vdev_id);
-	return wlan_vdev_mlme_sm_deliver_evt(
+	return wlan_vdev_mlme_sm_deliver_evt_sync(
 				vdev_mlme->vdev,
 				WLAN_VDEV_SM_EV_DISCONNECT_COMPLETE,
 				0, NULL);

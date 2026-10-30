@@ -3037,12 +3037,20 @@ void lim_mon_deinit_session(struct mac_context *mac_ptr,
 	if (session && session->bssType == eSIR_MONITOR_MODE) {
 		if (session->vdev &&
 		    wlan_vdev_mlme_get_state(session->vdev) == WLAN_VDEV_S_UP) {
+			int wait_count = 0;
+
 			pe_debug("lim_mon_deinit_session: bringing down monitor vdev %d",
 				 session->vdev_id);
 			wlan_vdev_mlme_sm_deliver_evt(session->vdev,
 						      WLAN_VDEV_SM_EV_DOWN,
 						      0, NULL);
-			qdf_sleep(50);
+			while (session->vdev &&
+			       wlan_vdev_mlme_get_state(session->vdev) != WLAN_VDEV_S_INIT &&
+			       wait_count < 100) {
+				msleep(20);
+				wait_count++;
+			}
+			msleep(100);
 		}
 		pe_delete_session(mac_ptr, session);
 	}

@@ -4098,8 +4098,11 @@ static int __hdd_open(struct net_device *dev)
 					     WLAN_CONTROL_PATH);
 	}
 
-	/* Enable carrier and transmit queues for NDI */
-	if (WLAN_HDD_IS_NDI(adapter)) {
+	/* Enable carrier and transmit queues for NDI and monitor mode */
+	if (WLAN_HDD_IS_NDI(adapter) ||
+	    wlan_hdd_is_session_type_monitor(adapter->device_mode) ||
+	    hdd_get_conparam() == QDF_GLOBAL_MONITOR_MODE ||
+	    dev->type == ARPHRD_IEEE80211_RADIOTAP) {
 		hdd_debug("Enabling Tx Queues");
 		wlan_hdd_netif_queue_control(adapter,
 			WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
@@ -4227,7 +4230,15 @@ static int __hdd_stop(struct net_device *dev)
 	 * layer. Skip BSS termination and adapter deletion for NAN Data
 	 * interface (NDI).
 	 */
-	if (WLAN_HDD_IS_NDI(adapter))
+	/*
+	 * NAN data interface and Monitor mode interface should not destroy
+	 * adapter and vdev on administrative ifdown (e.g. airmon-ng stop wlan0).
+	 * Monitor mode lifecycle and teardown is managed globally via con_mode.
+	 */
+	if (WLAN_HDD_IS_NDI(adapter) ||
+	    wlan_hdd_is_session_type_monitor(adapter->device_mode) ||
+	    hdd_get_conparam() == QDF_GLOBAL_MONITOR_MODE ||
+	    dev->type == ARPHRD_IEEE80211_RADIOTAP)
 		return 0;
 
 	/*
@@ -5094,12 +5105,32 @@ free_net_dev:
 	return NULL;
 }
 
+static int saved_wlan0_ifindex;
+static u32 saved_wlan0_wdev_id;
+
 static QDF_STATUS hdd_register_interface(struct hdd_adapter *adapter, bool rtnl_held)
 {
 	struct net_device *dev = adapter->dev;
 	int ret;
 
 	hdd_enter();
+
+	if (adapter->device_mode == QDF_STA_MODE ||
+	    adapter->device_mode == QDF_MONITOR_MODE) {
+		if (saved_wlan0_ifindex > 0 && !dev->ifindex) {
+			struct net_device *existing =
+				dev_get_by_index(dev_net(dev), saved_wlan0_ifindex);
+			if (existing) {
+				dev_put(existing);
+			} else {
+				dev->ifindex = saved_wlan0_ifindex;
+				if (saved_wlan0_wdev_id)
+					adapter->wdev.identifier = saved_wlan0_wdev_id;
+				hdd_info("Preserving primary wlan0 ifindex=%d wdev_id=%u",
+					 dev->ifindex, adapter->wdev.identifier);
+			}
+		}
+	}
 
 	if (rtnl_held) {
 		if (strnchr(dev->name, IFNAMSIZ - 1, '%')) {
@@ -5128,6 +5159,15 @@ static QDF_STATUS hdd_register_interface(struct hdd_adapter *adapter, bool rtnl_
 		}
 	}
 	set_bit(NET_DEVICE_REGISTERED, &adapter->event_flags);
+
+	if ((adapter->device_mode == QDF_STA_MODE ||
+	     adapter->device_mode == QDF_MONITOR_MODE) &&
+	    saved_wlan0_ifindex == 0) {
+		saved_wlan0_ifindex = dev->ifindex;
+		saved_wlan0_wdev_id = adapter->wdev.identifier;
+		hdd_info("Saved initial primary wlan0 ifindex=%d wdev_id=%u",
+			 saved_wlan0_ifindex, saved_wlan0_wdev_id);
+	}
 
 	hdd_exit();
 
@@ -6957,17 +6997,35 @@ QDF_STATUS hdd_stop_adapter(struct hdd_context *hdd_ctx,
 		 * before deleting peers or destroying the session/vdev.
 		 */
 		if (adapter->vdev &&
-		    wlan_vdev_mlme_get_state(adapter->vdev) == WLAN_VDEV_S_UP) {
-			hdd_info("Stopping monitor mode vdev %d before destroy",
-				 adapter->vdev_id);
-			wlan_vdev_mlme_sm_deliver_evt(adapter->vdev,
-						      WLAN_VDEV_SM_EV_DOWN,
-						      0, NULL);
-			qdf_sleep(50);
+		    (wlan_vdev_mlme_get_state(adapter->vdev) == WLAN_VDEV_S_UP ||
+		     adapter->mon_chan_freq != 0)) {
+			int wait_count = 0;
+
+			hdd_info("Stopping monitor mode vdev %d before destroy (state=%d freq=%d)",
+				 adapter->vdev_id,
+				 wlan_vdev_mlme_get_state(adapter->vdev),
+				 adapter->mon_chan_freq);
+			if (wlan_vdev_mlme_get_state(adapter->vdev) == WLAN_VDEV_S_UP) {
+				wlan_vdev_mlme_sm_deliver_evt(adapter->vdev,
+							      WLAN_VDEV_SM_EV_DOWN,
+							      0, NULL);
+				while (adapter->vdev &&
+				       wlan_vdev_mlme_get_state(adapter->vdev) != WLAN_VDEV_S_INIT &&
+				       wait_count < 100) {
+					msleep(20);
+					wait_count++;
+				}
+			}
+			msleep(100);
+			hdd_info("Monitor mode vdev %d state after down wait: %d (waited %d ms)",
+				 adapter->vdev_id,
+				 adapter->vdev ? wlan_vdev_mlme_get_state(adapter->vdev) : -1,
+				 wait_count * 20);
 		}
 		adapter->mon_chan_freq = 0;
 
 		sme_delete_mon_session(mac_handle, adapter->vdev_id);
+		msleep(100);
 		hdd_vdev_destroy(adapter);
 		break;
 
@@ -7937,6 +7995,11 @@ int wlan_hdd_set_mon_chan(struct hdd_adapter *adapter, qdf_freq_t freq,
 		return -EINVAL;
 	}
 
+	if (!freq) {
+		hdd_err("Invalid channel freq 0");
+		return -EINVAL;
+	}
+
 	/* Verify the BW before accepting this request */
 	ch_width = bandwidth;
 
@@ -8219,7 +8282,8 @@ QDF_STATUS hdd_start_all_adapters(struct hdd_context *hdd_ctx)
 			 * sends response for vdev start and vdev start response
 			 * timer expires and thus host triggers ASSERT.
 			 */
-			if (!test_bit(DOWN_DURING_SSR, &adapter->event_flags))
+			if (!test_bit(DOWN_DURING_SSR, &adapter->event_flags) &&
+			    adapter->mon_chan_freq != 0)
 				wlan_hdd_set_mon_chan(
 						adapter, adapter->mon_chan_freq,
 						adapter->mon_bandwidth);

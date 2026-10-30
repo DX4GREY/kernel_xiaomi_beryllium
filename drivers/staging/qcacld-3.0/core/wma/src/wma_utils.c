@@ -61,6 +61,7 @@
 #include "target_if.h"
 #include <wlan_utility.h>
 #include <wlan_mlme_main.h>
+#include "wlan_vdev_mlme_api.h"
 #include "host_diag_core_log.h"
 #include <wlan_mlme_api.h>
 #include <../../core/src/vdev_mgr_ops.h>
@@ -4676,10 +4677,12 @@ QDF_STATUS wma_mon_mlme_vdev_stop_send(struct vdev_mlme_obj *vdev_mlme,
 		WMA_LOGE("%s: Failed to send vdev stop cmd: vdev %d",
 			 __func__, vdev_id);
 
-	wlan_vdev_mlme_sm_deliver_evt(vdev_mlme->vdev,
-				      WLAN_VDEV_SM_EV_MLME_DOWN_REQ,
-				      0,
-				      NULL);
+	msleep(50);
+
+	wlan_vdev_mlme_sm_deliver_evt_sync(vdev_mlme->vdev,
+					   WLAN_VDEV_SM_EV_MLME_DOWN_REQ,
+					   0,
+					   NULL);
 
 	return status;
 }
@@ -4704,14 +4707,16 @@ QDF_STATUS wma_mon_mlme_vdev_down_send(struct vdev_mlme_obj *vdev_mlme,
 		WMA_LOGE("%s: Failed to send vdev down cmd: vdev %d",
 			 __func__, vdev_id);
 
+	msleep(50);
+
 	resp = qdf_mem_malloc(sizeof(*resp));
 	if (resp) {
 		resp->vdev_id = vdev_id;
 		resp->status = QDF_STATUS_SUCCESS;
-		wlan_vdev_mlme_sm_deliver_evt(vdev_mlme->vdev,
-					      WLAN_VDEV_SM_EV_DOWN_COMPLETE,
-					      sizeof(*resp),
-					      resp);
+		wlan_vdev_mlme_sm_deliver_evt_sync(vdev_mlme->vdev,
+						   WLAN_VDEV_SM_EV_DOWN_COMPLETE,
+						   sizeof(*resp),
+						   resp);
 		qdf_mem_free(resp);
 	}
 
