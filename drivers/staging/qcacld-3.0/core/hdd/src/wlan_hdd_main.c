@@ -14416,8 +14416,8 @@ hdd_open_mode_handlers[QDF_GLOBAL_MAX_MODE] = {
 	[QDF_GLOBAL_EPPING_MODE] = hdd_open_adapters_for_epping_mode,
 };
 
-static QDF_STATUS hdd_open_adapters_for_mode(struct hdd_context *hdd_ctx,
-					     enum QDF_GLOBAL_MODE driver_mode)
+QDF_STATUS hdd_open_adapters_for_mode(struct hdd_context *hdd_ctx,
+				     enum QDF_GLOBAL_MODE driver_mode)
 {
 	QDF_STATUS status;
 
@@ -16487,6 +16487,11 @@ static int __hdd_driver_mode_change(struct hdd_context *hdd_ctx,
 
 	curr_mode = hdd_get_conparam();
 	if (curr_mode == next_mode) {
+		if (!hdd_get_first_valid_adapter(hdd_ctx)) {
+			hdd_info("Driver in mode %d but no adapter found, reopening adapters",
+				 curr_mode);
+			return hdd_open_adapters_for_mode(hdd_ctx, next_mode);
+		}
 		hdd_err_rl("Driver is already in the requested mode");
 		return 0;
 	}
@@ -16495,6 +16500,8 @@ static int __hdd_driver_mode_change(struct hdd_context *hdd_ctx,
 
 	/* ensure adapters are stopped */
 	hdd_stop_present_mode(hdd_ctx, curr_mode);
+	if (curr_mode == QDF_GLOBAL_MONITOR_MODE)
+		qdf_sleep(100);
 
 	if (DRIVER_MODULES_CLOSED != hdd_ctx->driver_status) {
 		is_mode_change_psoc_idle_shutdown = true;
