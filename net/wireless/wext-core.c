@@ -714,10 +714,10 @@ static iw_handler get_handler(struct net_device *dev, unsigned int cmd)
 	return NULL;
 }
 
-static int ioctl_standard_iw_point(struct iw_point *iwp, unsigned int cmd,
-				   const struct iw_ioctl_description *descr,
-				   iw_handler handler, struct net_device *dev,
-				   struct iw_request_info *info)
+static __nocfi int ioctl_standard_iw_point(struct iw_point *iwp, unsigned int cmd,
+					   const struct iw_ioctl_description *descr,
+					   iw_handler handler, struct net_device *dev,
+					   struct iw_request_info *info)
 {
 	int err, extra_size, user_length = 0, essid_compat = 0;
 	char *extra;
@@ -899,7 +899,7 @@ out:
  * netif_running(dev) test. I'm open on that one...
  * Hopefully, the driver will remember to do a commit in "open()" ;-)
  */
-int call_commit_handler(struct net_device *dev)
+int __nocfi call_commit_handler(struct net_device *dev)
 {
 #ifdef CONFIG_WIRELESS_EXT
 	if (netif_running(dev) &&
@@ -1002,11 +1002,11 @@ static int wext_ioctl_dispatch(struct net *net, struct iwreq *iwr,
  * We do various checks and also take care of moving data between
  * user space and kernel space.
  */
-static int ioctl_standard_call(struct net_device *	dev,
-			       struct iwreq		*iwr,
-			       unsigned int		cmd,
-			       struct iw_request_info	*info,
-			       iw_handler		handler)
+static __nocfi int ioctl_standard_call(struct net_device *	dev,
+				       struct iwreq		*iwr,
+				       unsigned int		cmd,
+				       struct iw_request_info	*info,
+				       iw_handler		handler)
 {
 	const struct iw_ioctl_description *	descr;
 	int					ret = -EINVAL;
