@@ -24,9 +24,9 @@
 
 int cfg80211_wext_giwname(struct net_device *dev,
 			  struct iw_request_info *info,
-			  char *name, char *extra)
+			  union iwreq_data *wrqu, char *extra)
 {
-	strcpy(name, "IEEE 802.11");
+	strcpy(wrqu->name, "IEEE 802.11");
 	return 0;
 }
 EXPORT_WEXT_HANDLER(cfg80211_wext_giwname);

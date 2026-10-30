@@ -134,10 +134,10 @@ static int get_priv_descr_and_size(struct net_device *dev, unsigned int cmd,
 	return extra_size;
 }
 
-static int ioctl_private_iw_point(struct iw_point *iwp, unsigned int cmd,
-				  const struct iw_priv_args *descr,
-				  iw_handler handler, struct net_device *dev,
-				  struct iw_request_info *info, int extra_size)
+static __nocfi int ioctl_private_iw_point(struct iw_point *iwp, unsigned int cmd,
+					  const struct iw_priv_args *descr,
+					  iw_handler handler, struct net_device *dev,
+					  struct iw_request_info *info, int extra_size)
 {
 	char *extra;
 	int err;
@@ -184,7 +184,7 @@ out:
 	return err;
 }
 
-int ioctl_private_call(struct net_device *dev, struct iwreq *iwr,
+int __nocfi ioctl_private_call(struct net_device *dev, struct iwreq *iwr,
 		       unsigned int cmd, struct iw_request_info *info,
 		       iw_handler handler)
 {
@@ -210,7 +210,7 @@ int ioctl_private_call(struct net_device *dev, struct iwreq *iwr,
 }
 
 #ifdef CONFIG_COMPAT
-int compat_private_call(struct net_device *dev, struct iwreq *iwr,
+int __nocfi compat_private_call(struct net_device *dev, struct iwreq *iwr,
 			unsigned int cmd, struct iw_request_info *info,
 			iw_handler handler)
 {

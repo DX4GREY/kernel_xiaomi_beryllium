@@ -1605,10 +1605,26 @@ QDF_STATUS hdd_wlan_re_init(void)
 	/* Restart all adapters */
 	hdd_start_all_adapters(hdd_ctx);
 
+	/*
+	 * If no adapters exist (e.g. SSR triggered while switching driver modes),
+	 * reopen adapters for the current connection mode so that wlan0 netdev
+	 * is never lost.
+	 */
+	if (!hdd_get_first_valid_adapter(hdd_ctx)) {
+		enum QDF_GLOBAL_MODE conparam = hdd_get_conparam();
+
+		hdd_info("No adapter present during SSR re-init, reopening for mode %d",
+			 conparam);
+		hdd_open_adapters_for_mode(hdd_ctx, conparam);
+	}
+
 	hdd_init_scan_reject_params(hdd_ctx);
 
 	hdd_set_roaming_in_progress(false);
-	complete(&adapter->roaming_comp_var);
+	if (!adapter)
+		adapter = hdd_get_first_valid_adapter(hdd_ctx);
+	if (adapter)
+		complete(&adapter->roaming_comp_var);
 	hdd_ctx->bt_coex_mode_set = false;
 
 	/* Allow the phone to go to sleep */

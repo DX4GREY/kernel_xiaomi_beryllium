@@ -24228,6 +24228,15 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 
 	adapter->mon_chan_freq = chandef->chan->center_freq;
 	adapter->mon_bandwidth = ch_width;
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	{
+		tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
+
+		if (wma && adapter->vdev_id < wma->max_bssid)
+			wma->interfaces[adapter->vdev_id].mhz =
+				chandef->chan->center_freq;
+	}
+#endif
 
 	hdd_exit();
 

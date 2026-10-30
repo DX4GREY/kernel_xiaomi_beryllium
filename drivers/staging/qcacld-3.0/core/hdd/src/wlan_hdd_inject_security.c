@@ -237,8 +237,18 @@ static QDF_STATUS hdd_create_injection_session(struct injection_security_ctx *se
 	session->start_time = hdd_get_current_time_ms();
 	session->frame_count = 0;
 
-	/* Add to active sessions list */
+	/* Add to active sessions list, evicting oldest entry if full */
 	qdf_spin_lock_bh(&security_ctx->session_lock);
+	if (qdf_list_size(&security_ctx->active_sessions) >= 64) {
+		qdf_list_node_t *old_node;
+
+		if (QDF_IS_STATUS_SUCCESS(
+			qdf_list_remove_front(&security_ctx->active_sessions, &old_node))) {
+			struct injection_session *old_sess =
+				qdf_container_of(old_node, struct injection_session, node);
+			qdf_mem_free(old_sess);
+		}
+	}
 	status = qdf_list_insert_back(&security_ctx->active_sessions, &session->node);
 	qdf_spin_unlock_bh(&security_ctx->session_lock);
 

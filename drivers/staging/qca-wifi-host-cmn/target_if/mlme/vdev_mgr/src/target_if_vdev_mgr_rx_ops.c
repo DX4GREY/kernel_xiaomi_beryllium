@@ -360,6 +360,12 @@ static int target_if_vdev_mgr_stop_response_handler(ol_scn_t scn,
 		return -EINVAL;
 	}
 
+	if (!qdf_atomic_test_bit(STOP_RESPONSE_BIT, &vdev_rsp->rsp_status)) {
+		mlme_debug("PSOC_%d VDEV_%d: No active stop timer, ignoring response",
+			   wlan_psoc_get_id(psoc), vdev_id);
+		return 0;
+	}
+
 	status = target_if_vdev_mgr_rsp_timer_stop(psoc, vdev_rsp,
 						   STOP_RESPONSE_BIT);
 
@@ -422,6 +428,12 @@ static int target_if_vdev_mgr_delete_response_handler(ol_scn_t scn,
 		mlme_err("vdev response timer is null VDEV_%d PSOC_%d",
 			 vdev_del_resp.vdev_id, wlan_psoc_get_id(psoc));
 		return -EINVAL;
+	}
+
+	if (!qdf_atomic_test_bit(DELETE_RESPONSE_BIT, &vdev_rsp->rsp_status)) {
+		mlme_debug("PSOC_%d VDEV_%d: No active delete timer, ignoring response",
+			   wlan_psoc_get_id(psoc), vdev_del_resp.vdev_id);
+		return 0;
 	}
 
 	status = target_if_vdev_mgr_rsp_timer_stop(

@@ -261,6 +261,7 @@ QDF_STATUS hdd_frame_inject_enable(struct hdd_adapter *adapter)
 	}
 
 	injection_ctx = adapter->injection_ctx;
+	injection_ctx->is_disabled = false;
 	injection_ctx->is_monitor_mode = true;
 
 	hdd_inject_info("Frame injection enabled for adapter %pK", adapter);
@@ -278,6 +279,7 @@ QDF_STATUS hdd_frame_inject_enable(struct hdd_adapter *adapter)
 QDF_STATUS hdd_frame_inject_disable(struct hdd_adapter *adapter)
 {
 	struct hdd_injection_ctx *injection_ctx;
+	tp_wma_handle wma;
 
 	hdd_inject_debug("Disabling frame injection for adapter %pK", adapter);
 
@@ -287,9 +289,35 @@ QDF_STATUS hdd_frame_inject_disable(struct hdd_adapter *adapter)
 	}
 
 	injection_ctx = adapter->injection_ctx;
+	injection_ctx->is_disabled = true;
 	injection_ctx->is_monitor_mode = false;
 
-	hdd_inject_info("Frame injection disabled for adapter %pK", adapter);
+	/* Cancel and flush pending HDD workqueue processing */
+	qdf_cancel_work(&injection_ctx->queue_work);
+	qdf_flush_work(&injection_ctx->queue_work);
+
+	/* Drain and free any queued requests in HDD queue */
+	qdf_spin_lock_bh(&injection_ctx->queue_lock);
+	while (!qdf_list_empty(&injection_ctx->injection_queue)) {
+		qdf_list_node_t *node = NULL;
+		struct inject_frame_req *req;
+
+		if (QDF_IS_STATUS_ERROR(qdf_list_remove_front(
+				&injection_ctx->injection_queue, &node)))
+			break;
+		req = qdf_container_of(node, struct inject_frame_req, node);
+		if (req->frame_data)
+			qdf_mem_free(req->frame_data);
+		qdf_mem_free(req);
+	}
+	qdf_spin_unlock_bh(&injection_ctx->queue_lock);
+
+	/* Also flush WMA injection queue */
+	wma = cds_get_context(QDF_MODULE_ID_WMA);
+	if (wma)
+		wma_flush_injection_queue(wma);
+
+	hdd_inject_info("Frame injection disabled and flushed for adapter %pK", adapter);
 	return QDF_STATUS_SUCCESS;
 }
 
@@ -434,13 +462,13 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 	}
 
 	/*
-	 * Injection currently transmits via WMI mgmt-tx path, so only 802.11
-	 * management frames are supported on this path.
+	 * Injection supports 802.11 management (0x00), control (0x04),
+	 * and data (0x08) frames for pen-testing tools (aireplay-ng, mdk4, etc.).
 	 */
 	frame_type = req->frame_data[0] & 0x0c;
-	if (frame_type != 0x00) {
+	if (frame_type != 0x00 && frame_type != 0x04 && frame_type != 0x08) {
 		hdd_update_injection_stats(adapter, HDD_INJECTION_STAT_VALIDATION_FAILURES, 1);
-		hdd_inject_warn("Dropping non-management injection frame: fc_type=0x%02x len=%u",
+		hdd_inject_warn("Dropping invalid injection frame type: fc_type=0x%02x len=%u",
 				frame_type, req->frame_len);
 		return QDF_STATUS_E_NOSUPPORT;
 	}
@@ -584,8 +612,8 @@ void hdd_process_injection_queue_work(void *arg)
 	QDF_STATUS status;
 	static bool queue_tx_path_logged;
 
-	if (!injection_ctx) {
-		hdd_inject_err("Invalid injection context");
+	if (!injection_ctx || injection_ctx->is_disabled) {
+		hdd_inject_debug("Invalid or disabled injection context");
 		return;
 	}
 
@@ -614,7 +642,8 @@ void hdd_process_injection_queue_work(void *arg)
 				bool monitor_mode_active =
 					injection_ctx->is_monitor_mode;
 
-				if (!monitor_mode_active && injection_ctx->adapter) {
+				if (!monitor_mode_active && !injection_ctx->is_disabled &&
+				    injection_ctx->adapter) {
 					struct net_device *tx_dev =
 						injection_ctx->adapter->dev;
 

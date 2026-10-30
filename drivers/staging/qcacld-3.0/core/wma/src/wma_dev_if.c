@@ -560,6 +560,7 @@ static void wma_handle_monitor_mode_vdev_detach(tp_wma_handle wma,
 		wlan_vdev_mlme_sm_deliver_evt(iface->vdev,
 					      WLAN_VDEV_SM_EV_DOWN,
 					      sizeof(*resp), resp);
+		qdf_mem_free(resp);
 	}
 	iface->vdev_active = false;
 }
@@ -592,8 +593,22 @@ static QDF_STATUS wma_handle_vdev_detach(tp_wma_handle wma_handle,
 		goto rel_ref;
 	}
 
-	if (cds_get_conparam() == QDF_GLOBAL_MONITOR_MODE)
-		wma_handle_monitor_mode_vdev_detach(wma_handle, vdev_id);
+	if (cds_get_conparam() == QDF_GLOBAL_MONITOR_MODE ||
+	    iface->type == WMI_VDEV_TYPE_MONITOR) {
+		if (iface->vdev &&
+		    wlan_vdev_mlme_get_state(iface->vdev) == WLAN_VDEV_S_UP) {
+			int wait_count = 0;
+
+			wma_handle_monitor_mode_vdev_detach(wma_handle, vdev_id);
+			while (iface->vdev &&
+			       wlan_vdev_mlme_get_state(iface->vdev) != WLAN_VDEV_S_INIT &&
+			       wait_count < 100) {
+				msleep(20);
+				wait_count++;
+			}
+			msleep(100);
+		}
+	}
 
 	iface->del_staself_req = del_vdev_req_param;
 	wma_cdp_vdev_detach(soc, wma_handle, vdev_id);
@@ -632,18 +647,21 @@ static QDF_STATUS wma_self_peer_remove(tp_wma_handle wma_handle,
 	uint8_t vdev_id = del_vdev_req->vdev_id;
 	struct wma_target_req *msg = NULL;
 	struct del_sta_self_rsp_params *sta_self_wmi_rsp;
+	bool no_fw_delete = (wma_handle->interfaces[vdev_id].type == WMI_VDEV_TYPE_MONITOR ||
+			     cds_get_conparam() == QDF_GLOBAL_MONITOR_MODE);
 
-	wma_debug("P2P Device: removing self peer "QDF_MAC_ADDR_FMT,
-		  QDF_MAC_ADDR_REF(del_vdev_req->self_mac_addr));
+	wma_debug("P2P/Mon Device: removing self peer "QDF_MAC_ADDR_FMT" (no_fw_delete=%d)",
+		  QDF_MAC_ADDR_REF(del_vdev_req->self_mac_addr), no_fw_delete);
 
 	qdf_status = wma_remove_peer(wma_handle, del_vdev_req->self_mac_addr,
-				     vdev_id, false);
+				     vdev_id, no_fw_delete);
 	if (QDF_IS_STATUS_ERROR(qdf_status)) {
 		wma_err("wma_remove_peer is failed");
 		goto error;
 	}
 
-	if (wmi_service_enabled(wma_handle->wmi_handle,
+	if (!no_fw_delete &&
+	    wmi_service_enabled(wma_handle->wmi_handle,
 				wmi_service_sync_delete_cmds)) {
 		sta_self_wmi_rsp =
 			qdf_mem_malloc(sizeof(struct del_sta_self_rsp_params));
@@ -816,6 +834,22 @@ QDF_STATUS wma_vdev_detach(tp_wma_handle wma_handle,
 
 	iface->is_del_sta_defered = false;
 
+	if (iface->type == WMI_VDEV_TYPE_MONITOR && iface->vdev &&
+	    wlan_vdev_mlme_get_state(iface->vdev) == WLAN_VDEV_S_UP) {
+		int wait_count = 0;
+
+		wma_debug("wma_vdev_detach: bringing down active monitor vdev %d before peer delete",
+			  vdev_id);
+		wma_handle_monitor_mode_vdev_detach(wma_handle, vdev_id);
+		while (iface->vdev &&
+		       wlan_vdev_mlme_get_state(iface->vdev) != WLAN_VDEV_S_INIT &&
+		       wait_count < 100) {
+			msleep(20);
+			wait_count++;
+		}
+		msleep(100);
+	}
+
 	status = wma_vdev_self_peer_delete(wma_handle, pdel_vdev_req_param);
 
 	if (QDF_IS_STATUS_ERROR(status)) {
@@ -828,7 +862,9 @@ QDF_STATUS wma_vdev_detach(tp_wma_handle wma_handle,
 
 	if (!wma_vdev_uses_self_peer(iface->type, iface->sub_type) ||
 	    !wmi_service_enabled(wma_handle->wmi_handle,
-	    wmi_service_sync_delete_cmds)) {
+	    wmi_service_sync_delete_cmds) ||
+	    iface->type == WMI_VDEV_TYPE_MONITOR ||
+	    cds_get_conparam() == QDF_GLOBAL_MONITOR_MODE) {
 		status = wma_handle_vdev_detach(wma_handle,
 						pdel_vdev_req_param);
 	}
@@ -1655,10 +1691,13 @@ QDF_STATUS wma_remove_peer(tp_wma_handle wma, uint8_t *mac_addr,
 	peer_tid_bitmap &= ~(0x1 << WMI_MGMT_TID);
 	param.peer_tid_bitmap = peer_tid_bitmap;
 	param.vdev_id = vdev_id;
-	if (!wmi_service_enabled(wma->wmi_handle,
-				 wmi_service_peer_delete_no_peer_flush_tids_cmd))
-		wmi_unified_peer_flush_tids_send(wma->wmi_handle, mac_addr,
-						 &param);
+	if (wma->interfaces[vdev_id].type != WMI_VDEV_TYPE_MONITOR &&
+	    cds_get_conparam() != QDF_GLOBAL_MONITOR_MODE) {
+		if (!wmi_service_enabled(wma->wmi_handle,
+					 wmi_service_peer_delete_no_peer_flush_tids_cmd))
+			wmi_unified_peer_flush_tids_send(wma->wmi_handle, mac_addr,
+							 &param);
+	}
 
 	/* peer->ref_cnt is not visible in WMA */
 	wlan_roam_debug_log(vdev_id, DEBUG_PEER_DELETE_SEND,
@@ -1899,8 +1938,10 @@ QDF_STATUS wma_create_peer(tp_wma_handle wma,
 	if (peer_type == WMI_PEER_TYPE_TDLS)
 		cdp_peer_set_peer_as_tdls(dp_soc, vdev_id, peer_addr, true);
 
-	if (roam_synch_in_progress) {
-		WMA_LOGD("%s: LFR3: Created peer "QDF_MAC_ADDR_FMT" vdev_id %d, peer_count %d",
+	if (roam_synch_in_progress ||
+	    wma->interfaces[vdev_id].type == WMI_VDEV_TYPE_MONITOR ||
+	    cds_get_conparam() == QDF_GLOBAL_MONITOR_MODE) {
+		WMA_LOGD("%s: Mon/LFR3: Created peer "QDF_MAC_ADDR_FMT" vdev_id %d, peer_count %d",
 			 __func__,
 			 QDF_MAC_ADDR_REF(peer_addr), vdev_id,
 			 wma->interfaces[vdev_id].peer_count);
@@ -2318,11 +2359,12 @@ __wma_handle_vdev_stop_rsp(struct vdev_stop_response *resp_event)
 		return QDF_STATUS_E_INVAL;
 	}
 
-	/* Ignore stop_response in Monitor mode */
-	if (cds_get_conparam() == QDF_GLOBAL_MONITOR_MODE)
-		return  QDF_STATUS_SUCCESS;
-
 	iface = &wma->interfaces[resp_event->vdev_id];
+
+	/* Ignore stop_response in Monitor mode */
+	if (cds_get_conparam() == QDF_GLOBAL_MONITOR_MODE ||
+	    iface->type == WMI_VDEV_TYPE_MONITOR)
+		return  QDF_STATUS_SUCCESS;
 
 	/* vdev in stopped state, no more waiting for key */
 	iface->is_waiting_for_key = false;

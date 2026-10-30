@@ -4772,4 +4772,14 @@ void hdd_init_start_completion(void);
  */
 void hdd_netdev_update_features(struct hdd_adapter *adapter);
 
+/**
+ * hdd_open_adapters_for_mode - Open/create adapters for specified driver mode
+ * @hdd_ctx: Pointer to HDD context
+ * @driver_mode: Mode to create adapters for
+ *
+ * Return: QDF_STATUS
+ */
+QDF_STATUS hdd_open_adapters_for_mode(struct hdd_context *hdd_ctx,
+				     enum QDF_GLOBAL_MODE driver_mode);
+
 #endif /* end #if !defined(WLAN_HDD_MAIN_H) */
