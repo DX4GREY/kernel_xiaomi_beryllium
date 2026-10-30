@@ -434,13 +434,13 @@ QDF_STATUS hdd_process_frame_injection(struct hdd_adapter *adapter,
 	}
 
 	/*
-	 * Injection currently transmits via WMI mgmt-tx path, so only 802.11
-	 * management frames are supported on this path.
+	 * Injection supports 802.11 management (0x00), control (0x04),
+	 * and data (0x08) frames for pen-testing tools (aireplay-ng, mdk4, etc.).
 	 */
 	frame_type = req->frame_data[0] & 0x0c;
-	if (frame_type != 0x00) {
+	if (frame_type != 0x00 && frame_type != 0x04 && frame_type != 0x08) {
 		hdd_update_injection_stats(adapter, HDD_INJECTION_STAT_VALIDATION_FAILURES, 1);
-		hdd_inject_warn("Dropping non-management injection frame: fc_type=0x%02x len=%u",
+		hdd_inject_warn("Dropping invalid injection frame type: fc_type=0x%02x len=%u",
 				frame_type, req->frame_len);
 		return QDF_STATUS_E_NOSUPPORT;
 	}

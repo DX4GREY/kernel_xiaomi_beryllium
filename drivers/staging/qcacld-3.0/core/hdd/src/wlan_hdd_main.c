@@ -8019,6 +8019,15 @@ int wlan_hdd_set_mon_chan(struct hdd_adapter *adapter, qdf_freq_t freq,
 		adapter->monitor_mode_vdev_up_in_progress = false;
 	}
 
+#ifdef FEATURE_FRAME_INJECTION_SUPPORT
+	if (QDF_IS_STATUS_SUCCESS(status)) {
+		tp_wma_handle wma = cds_get_context(QDF_MODULE_ID_WMA);
+
+		if (wma && adapter->vdev_id < wma->max_bssid)
+			wma->interfaces[adapter->vdev_id].mhz = freq;
+	}
+#endif
+
 	return qdf_status_to_os_return(status);
 }
 #endif

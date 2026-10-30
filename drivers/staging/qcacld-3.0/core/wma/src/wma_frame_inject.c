@@ -82,14 +82,15 @@ static inline void wma_injection_unmap_tx_buf(qdf_nbuf_t buf)
 #define WMA_FRAME_INJECT_QUEUE_TIMEOUT_MS  100
 
 /* Reaper timer interval: how often we scan for stale in-flight nbufs (ms) */
-#define WMA_INJECTION_REAPER_INTERVAL_MS   3000
+#define WMA_INJECTION_REAPER_INTERVAL_MS   250
 
 /*
  * Maximum age (in microseconds, QDF log-timestamp units) before an
  * in-flight nbuf is considered abandoned by firmware and reaped.
- * 2 seconds is generous — normal completions arrive in < 50 ms.
+ * Completions on helper STA vdev never arrive, so 400 ms timeout avoids
+ * queue starvation while penetration tools inject at high rates.
  */
-#define WMA_INJECTION_NBUF_TIMEOUT_US      2000000ULL
+#define WMA_INJECTION_NBUF_TIMEOUT_US      400000ULL
 
 /*
  * Maximum number of in-flight (submitted but uncomplemented) nbufs before
@@ -207,7 +208,9 @@ struct wma_injection_tx_vdev {
 };
 
 static struct wma_injection_tx_vdev g_inj_tx_vdev;
+static qdf_mutex_t g_inj_tx_vdev_mutex;
 
+static void __wma_injection_destroy_tx_vdev(tp_wma_handle wma);
 static void wma_injection_destroy_tx_vdev(tp_wma_handle wma);
 
 /**
@@ -278,13 +281,17 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	if (!wma || !wma->wmi_handle)
 		return QDF_STATUS_E_INVAL;
 
+	qdf_mutex_acquire(&g_inj_tx_vdev_mutex);
+
 	/*
 	 * If frequency is zero or unassigned, fallback to existing helper frequency,
 	 * any active interface frequency, or default 2412 MHz.
 	 */
 	if (!chanfreq) {
-		if (g_inj_tx_vdev.created && g_inj_tx_vdev.chanfreq)
+		if (g_inj_tx_vdev.created && g_inj_tx_vdev.chanfreq) {
+			qdf_mutex_release(&g_inj_tx_vdev_mutex);
 			return QDF_STATUS_SUCCESS;
+		}
 
 		for (i = 0; i < (int)wma->max_bssid; i++) {
 			if (wma->interfaces[i].mhz) {
@@ -297,10 +304,12 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	}
 
 	if (g_inj_tx_vdev.created) {
-		if (g_inj_tx_vdev.chanfreq == chanfreq)
+		if (g_inj_tx_vdev.chanfreq == chanfreq) {
+			qdf_mutex_release(&g_inj_tx_vdev_mutex);
 			return QDF_STATUS_SUCCESS;
+		}
 		/* Channel changed – tear down and recreate */
-		wma_injection_destroy_tx_vdev(wma);
+		__wma_injection_destroy_tx_vdev(wma);
 	}
 
 	/*
@@ -325,6 +334,7 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	}
 	if (!found) {
 		wma_err("Injection: no unused vdev slot for TX helper");
+		qdf_mutex_release(&g_inj_tx_vdev_mutex);
 		return QDF_STATUS_E_RESOURCES;
 	}
 
@@ -388,6 +398,7 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 					      inj_mac, &vcreate);
 	if (QDF_IS_STATUS_ERROR(status)) {
 		wma_err("Injection TX vdev create failed: %d", status);
+		qdf_mutex_release(&g_inj_tx_vdev_mutex);
 		return status;
 	}
 	/* Firmware processes WMI commands asynchronously.  Each step must
@@ -413,7 +424,7 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	status = wmi_unified_vdev_start_send(wma->wmi_handle, &vstart);
 	if (QDF_IS_STATUS_ERROR(status)) {
 		wma_err("Injection TX vdev start failed: %d", status);
-		goto err_stop;
+		goto err_delete;
 	}
 	msleep(150);
 
@@ -445,24 +456,34 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 
 	wma_info("Injection TX helper vdev created: vdev_id=%u mac=%pM freq=%u type=STA",
 		 vid, inj_mac, chanfreq);
+	qdf_mutex_release(&g_inj_tx_vdev_mutex);
 	return QDF_STATUS_SUCCESS;
 
 err_stop:
+	wmi_unified_vdev_stop_send(wma->wmi_handle, vid);
+	msleep(50);
+err_delete:
 	wmi_unified_vdev_delete_send(wma->wmi_handle, vid);
+	qdf_mutex_release(&g_inj_tx_vdev_mutex);
 	return status;
 }
 
 /**
- * wma_injection_destroy_tx_vdev() - Tear down the hidden injection TX vdev
+ * __wma_injection_destroy_tx_vdev() - Tear down the hidden injection TX vdev
  * @wma: WMA handle
  *
- * Late-path teardown (called from deinit_injection_queue / wma_close).
- * WMI may already be stopped, so failures are tolerated.
+ * Internal helper. Caller MUST hold g_inj_tx_vdev_mutex.
  */
-static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
+static void __wma_injection_destroy_tx_vdev(tp_wma_handle wma)
 {
-	if (!g_inj_tx_vdev.created || !wma || !wma->wmi_handle)
+	if (!g_inj_tx_vdev.created || !wma)
 		return;
+
+	if (!wma->wmi_handle) {
+		wma_warn("WMI down, clearing injection vdev state only");
+		qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
+		return;
+	}
 
 	/*
 	 * Proper teardown order (reverse of create):
@@ -495,6 +516,20 @@ static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
 }
 
 /**
+ * wma_injection_destroy_tx_vdev() - Tear down the hidden injection TX vdev
+ * @wma: WMA handle
+ *
+ * Late-path teardown (called from deinit_injection_queue / wma_close).
+ * WMI may already be stopped, so failures are tolerated.
+ */
+static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
+{
+	qdf_mutex_acquire(&g_inj_tx_vdev_mutex);
+	__wma_injection_destroy_tx_vdev(wma);
+	qdf_mutex_release(&g_inj_tx_vdev_mutex);
+}
+
+/**
  * wma_injection_pre_stop_cleanup() - Destroy injection helper vdev before
  *                                     monitor mode stop
  * @wma_handle: WMA handle
@@ -503,10 +538,6 @@ static void wma_injection_destroy_tx_vdev(tp_wma_handle wma)
  * VDEV_STOP / VDEV_DELETE for the monitor vdev.  The firmware asserts
  * in dispatch_wlan_pdev_cmds if an orphaned STA helper vdev is still
  * present when the monitor vdev is torn down.
- *
- * Proper teardown order (reverse of create):
- *   PEER_DELETE → VDEV_STOP → VDEV_DELETE
- * with msleep() gaps so the firmware can process each command.
  */
 void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
 {
@@ -515,38 +546,16 @@ void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
 		return;
 	}
 
-	if (!g_inj_tx_vdev.created)
-		return;
-
-	if (!wma_handle->wmi_handle) {
-		/* WMI already gone – just clear host state */
-		wma_warn("WMI down, clearing injection vdev state only");
-		qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
+	qdf_mutex_acquire(&g_inj_tx_vdev_mutex);
+	if (!g_inj_tx_vdev.created) {
+		qdf_mutex_release(&g_inj_tx_vdev_mutex);
 		return;
 	}
 
 	wma_info("Pre-stop cleanup: destroying injection helper vdev_id=%u",
 		 g_inj_tx_vdev.vdev_id);
-
-	/* 1. PEER_DELETE */
-	wmi_unified_peer_delete_send(wma_handle->wmi_handle,
-				     g_inj_tx_vdev.mac_addr,
-				     g_inj_tx_vdev.vdev_id);
-	msleep(100);
-
-	/* 2. VDEV_STOP (we did VDEV_START during create) */
-	wmi_unified_vdev_stop_send(wma_handle->wmi_handle,
-				   g_inj_tx_vdev.vdev_id);
-	msleep(100);
-
-	/* 3. VDEV_DELETE */
-	wmi_unified_vdev_delete_send(wma_handle->wmi_handle,
-				     g_inj_tx_vdev.vdev_id);
-	msleep(100);
-
-	wma_info("Pre-stop cleanup: injection helper vdev destroyed: vdev_id=%u",
-		 g_inj_tx_vdev.vdev_id);
-	qdf_mem_zero(&g_inj_tx_vdev, sizeof(g_inj_tx_vdev));
+	__wma_injection_destroy_tx_vdev(wma_handle);
+	qdf_mutex_release(&g_inj_tx_vdev_mutex);
 }
 
 static void
@@ -975,28 +984,15 @@ static void wma_process_injection_queue_delayed_work(void *context)
 }
 
 /**
- * wma_injection_reaper_work_cb() - Periodic reaper for stale injection nbufs
- * @context: Unused
+ * wma_injection_reap_stale_nbufs() - Sweep and free stale in-flight nbufs
  *
- * The firmware never sends TX-completion events for frames sent on the hidden
- * STA helper vdev because the per-vdev completion callback pointer is NULL in
- * FW context (see wal_local_frame_mgmt_tx_completion / FUN_b013dd78).  Left
- * unchecked the DMA-mapped nbufs accumulate, eventually triggering an SMMU
- * translation fault and a firmware crash.
- *
- * This worker runs every WMA_INJECTION_REAPER_INTERVAL_MS (3 s), scans the
- * debug cache, and frees any entry whose submit_ts is older than
- * WMA_INJECTION_NBUF_TIMEOUT_US (2 s).
+ * Return: number of freed nbufs
  */
-static void wma_injection_reaper_work_cb(void *context)
+static uint32_t wma_injection_reap_stale_nbufs(void)
 {
-	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
 	uint64_t now_ts, age_us;
 	uint32_t reaped = 0;
 	int i;
-
-	if (!ctx->is_initialized)
-		return;
 
 	now_ts = qdf_get_log_timestamp();
 
@@ -1025,6 +1021,33 @@ static void wma_injection_reaper_work_cb(void *context)
 		qdf_atomic_dec(&g_wma_injection_ctx.inflight_count);
 		reaped++;
 	}
+
+	return reaped;
+}
+
+/**
+ * wma_injection_reaper_work_cb() - Periodic reaper for stale injection nbufs
+ * @context: Unused
+ *
+ * The firmware never sends TX-completion events for frames sent on the hidden
+ * STA helper vdev because the per-vdev completion callback pointer is NULL in
+ * FW context (see wal_local_frame_mgmt_tx_completion / FUN_b013dd78).  Left
+ * unchecked the DMA-mapped nbufs accumulate, eventually triggering an SMMU
+ * translation fault and a firmware crash.
+ *
+ * This worker runs every WMA_INJECTION_REAPER_INTERVAL_MS, scans the
+ * debug cache, and frees any entry whose submit_ts is older than
+ * WMA_INJECTION_NBUF_TIMEOUT_US.
+ */
+static void wma_injection_reaper_work_cb(void *context)
+{
+	struct wma_injection_queue_ctx *ctx = &g_wma_injection_ctx;
+	uint32_t reaped;
+
+	if (!ctx->is_initialized)
+		return;
+
+	reaped = wma_injection_reap_stale_nbufs();
 
 	if (reaped)
 		wma_info("Reaper: freed %u stale injection nbufs, inflight now %d",
@@ -1089,6 +1112,7 @@ QDF_STATUS wma_init_injection_queue(tp_wma_handle wma_handle)
 	ctx->max_queue_size = WMA_FRAME_INJECT_MAX_QUEUE_SIZE;
 	qdf_mem_zero(&ctx->stats, sizeof(ctx->stats));
 	qdf_atomic_init(&ctx->inflight_count);
+	qdf_mutex_create(&g_inj_tx_vdev_mutex);
 	ctx->is_initialized = true;
 
 	/* Arm the reaper */
@@ -1123,6 +1147,7 @@ QDF_STATUS wma_deinit_injection_queue(tp_wma_handle wma_handle)
 
 	/* Destroy hidden injection TX vdev if present */
 	wma_injection_destroy_tx_vdev(wma_handle);
+	qdf_mutex_destroy(&g_inj_tx_vdev_mutex);
 
 	/* Cancel any pending work */
 	qdf_cancel_work(&ctx->queue_work);
@@ -1238,12 +1263,17 @@ QDF_STATUS wma_queue_injection_frame(tp_wma_handle wma_handle,
 
 	/*
 	 * Inflight backpressure: if too many nbufs are waiting for FW
-	 * completions that will never arrive, reject early to avoid
-	 * exhausting DMA-mapped memory and triggering an SMMU fault.
-	 * The reaper timer will gradually free the stale entries.
+	 * completions that will never arrive, reap stale entries inline first.
+	 * If still over threshold, reject early to avoid exhausting
+	 * DMA-mapped memory and triggering an SMMU fault.
 	 */
 	{
 		int inflight = qdf_atomic_read(&ctx->inflight_count);
+
+		if (inflight >= WMA_INJECTION_INFLIGHT_HIGH) {
+			wma_injection_reap_stale_nbufs();
+			inflight = qdf_atomic_read(&ctx->inflight_count);
+		}
 
 		if (inflight >= WMA_INJECTION_INFLIGHT_HIGH) {
 			ctx->stats.frames_dropped++;
@@ -1447,7 +1477,7 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	}
 
 	if (!inject_patch_banner_logged) {
-		wma_info("Injection patch tag: monitor_sta_vdev_tx_v7");
+		wma_info("Injection patch tag: monitor_sta_vdev_tx_v8_antipanic_multiframe");
 		inject_patch_banner_logged = true;
 	}
 

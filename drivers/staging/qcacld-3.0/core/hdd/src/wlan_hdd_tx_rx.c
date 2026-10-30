@@ -1028,7 +1028,7 @@ static void hdd_monitor_mode_tx_inject(struct hdd_adapter *adapter,
 	req->retry_count = 0;
 	req->tx_rate = 0;
 	req->timestamp = now;
-	req->session_id = (uint32_t)now;
+	req->session_id = current->pid ? (uint32_t)current->pid : 1;
 	req->submit_time = now;
 	req->queue_time = 0;
 	req->process_time = 0;

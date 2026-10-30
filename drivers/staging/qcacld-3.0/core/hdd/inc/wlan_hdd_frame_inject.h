@@ -52,10 +52,10 @@ struct wireless_dev;
 #define HDD_FRAME_INJECT_MAX_SIZE        2304
 
 /* Maximum number of frames in injection queue per adapter */
-#define HDD_FRAME_INJECT_MAX_QUEUE_SIZE  64
+#define HDD_FRAME_INJECT_MAX_QUEUE_SIZE  512
 
 /* Default rate limit: frames per second */
-#define HDD_FRAME_INJECT_DEFAULT_RATE_LIMIT  100
+#define HDD_FRAME_INJECT_DEFAULT_RATE_LIMIT  5000
 
 /* Rate limiting window in milliseconds */
 #define HDD_FRAME_INJECT_RATE_WINDOW_MS  1000
