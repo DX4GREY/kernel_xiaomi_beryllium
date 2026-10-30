@@ -136,6 +136,7 @@
 #include "wifi_pos_api.h"
 #include "wlan_hdd_oemdata.h"
 #include "wlan_hdd_he.h"
+#include "wlan_vdev_mlme_api.h"
 #include "os_if_nan.h"
 #include "nan_public_structs.h"
 #include "nan_ucfg_api.h"
@@ -6949,6 +6950,23 @@ QDF_STATUS hdd_stop_adapter(struct hdd_context *hdd_ctx,
 		status = hdd_monitor_mode_vdev_status(adapter);
 		if (QDF_IS_STATUS_ERROR(status))
 			hdd_err_rl("stop failed montior mode");
+
+		/*
+		 * If monitor mode vdev was started in FW (e.g. after channel set),
+		 * gracefully stop and bring down the vdev in firmware via MLME SM
+		 * before deleting peers or destroying the session/vdev.
+		 */
+		if (adapter->vdev &&
+		    wlan_vdev_mlme_get_state(adapter->vdev) == WLAN_VDEV_S_UP) {
+			hdd_info("Stopping monitor mode vdev %d before destroy",
+				 adapter->vdev_id);
+			wlan_vdev_mlme_sm_deliver_evt(adapter->vdev,
+						      WLAN_VDEV_SM_EV_DOWN,
+						      0, NULL);
+			qdf_sleep(50);
+		}
+		adapter->mon_chan_freq = 0;
+
 		sme_delete_mon_session(mac_handle, adapter->vdev_id);
 		hdd_vdev_destroy(adapter);
 		break;

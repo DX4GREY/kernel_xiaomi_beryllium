@@ -816,6 +816,14 @@ QDF_STATUS wma_vdev_detach(tp_wma_handle wma_handle,
 
 	iface->is_del_sta_defered = false;
 
+	if (iface->type == WMI_VDEV_TYPE_MONITOR && iface->vdev &&
+	    wlan_vdev_mlme_get_state(iface->vdev) == WLAN_VDEV_S_UP) {
+		wma_debug("wma_vdev_detach: bringing down active monitor vdev %d before peer delete",
+			  vdev_id);
+		wma_handle_monitor_mode_vdev_detach(wma_handle, vdev_id);
+		qdf_sleep(50);
+	}
+
 	status = wma_vdev_self_peer_delete(wma_handle, pdel_vdev_req_param);
 
 	if (QDF_IS_STATUS_ERROR(status)) {

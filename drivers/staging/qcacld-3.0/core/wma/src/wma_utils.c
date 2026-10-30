@@ -4712,6 +4712,7 @@ QDF_STATUS wma_mon_mlme_vdev_down_send(struct vdev_mlme_obj *vdev_mlme,
 					      WLAN_VDEV_SM_EV_DOWN_COMPLETE,
 					      sizeof(*resp),
 					      resp);
+		qdf_mem_free(resp);
 	}
 
 	return status;
