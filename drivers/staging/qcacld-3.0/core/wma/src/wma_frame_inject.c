@@ -212,6 +212,7 @@ static qdf_mutex_t g_inj_tx_vdev_mutex;
 
 static void __wma_injection_destroy_tx_vdev(tp_wma_handle wma);
 static void wma_injection_destroy_tx_vdev(tp_wma_handle wma);
+static uint32_t wma_injection_reap_stale_nbufs(bool force);
 
 /**
  * wma_injection_reset_session_state() - Reset per-session static state
@@ -476,6 +477,8 @@ err_delete:
  */
 static void __wma_injection_destroy_tx_vdev(tp_wma_handle wma)
 {
+	int wait_count = 0;
+
 	if (!g_inj_tx_vdev.created || !wma)
 		return;
 
@@ -486,13 +489,41 @@ static void __wma_injection_destroy_tx_vdev(tp_wma_handle wma)
 	}
 
 	/*
-	 * Proper teardown order (reverse of create):
-	 *   PEER_DELETE → VDEV_STOP → VDEV_DELETE
-	 * Each step needs a sleep so firmware finishes processing
-	 * before the next command arrives.  Without this, a
-	 * subsequent VDEV_CREATE for the same slot races with the
-	 * pending DELETE and firmware asserts.
+	 * Wait for any in-flight frames to complete in firmware before
+	 * tearing down the peer and vdev. Deleting active peers/vdevs
+	 * with pending TX frames causes firmware asserts/crashes.
 	 */
+	while (qdf_atomic_read(&g_wma_injection_ctx.inflight_count) > 0 &&
+	       wait_count < 10) {
+		msleep(20);
+		wait_count++;
+	}
+
+	/* Force reap any leftover in-flight nbufs */
+	wma_injection_reap_stale_nbufs(true);
+
+	/*
+	 * Proper teardown order (reverse of create):
+	 *   PEER_FLUSH_TIDS → PEER_DELETE → VDEV_STOP → VDEV_DELETE
+	 * Each step needs a sleep so firmware finishes processing
+	 * before the next command arrives.
+	 */
+
+	/* 0. PEER_FLUSH_TIDS */
+	{
+		struct peer_flush_params param = {0};
+
+		param.peer_tid_bitmap = 0xffffffff;
+		param.vdev_id = g_inj_tx_vdev.vdev_id;
+		qdf_mem_copy(param.peer_mac, g_inj_tx_vdev.mac_addr,
+			     QDF_MAC_ADDR_SIZE);
+		if (!wmi_service_enabled(wma->wmi_handle,
+					 wmi_service_peer_delete_no_peer_flush_tids_cmd))
+			wmi_unified_peer_flush_tids_send(wma->wmi_handle,
+							 g_inj_tx_vdev.mac_addr,
+							 &param);
+	}
+	msleep(50);
 
 	/* 1. PEER_DELETE */
 	wmi_unified_peer_delete_send(wma->wmi_handle,
@@ -545,6 +576,9 @@ void wma_injection_pre_stop_cleanup(tp_wma_handle wma_handle)
 		wma_err("Invalid WMA handle for pre-stop cleanup");
 		return;
 	}
+
+	/* Drain and cancel queued frames first */
+	wma_flush_injection_queue(wma_handle);
 
 	qdf_mutex_acquire(&g_inj_tx_vdev_mutex);
 	if (!g_inj_tx_vdev.created) {
@@ -985,10 +1019,11 @@ static void wma_process_injection_queue_delayed_work(void *context)
 
 /**
  * wma_injection_reap_stale_nbufs() - Sweep and free stale in-flight nbufs
+ * @force: If true, reap all valid buffers regardless of age
  *
  * Return: number of freed nbufs
  */
-static uint32_t wma_injection_reap_stale_nbufs(void)
+static uint32_t wma_injection_reap_stale_nbufs(bool force)
 {
 	uint64_t now_ts, age_us;
 	uint32_t reaped = 0;
@@ -1008,10 +1043,11 @@ static uint32_t wma_injection_reap_stale_nbufs(void)
 		 */
 		age_us = qdf_log_timestamp_to_usecs(now_ts - e->submit_ts);
 
-		if (age_us < WMA_INJECTION_NBUF_TIMEOUT_US)
+		if (!force && age_us < WMA_INJECTION_NBUF_TIMEOUT_US)
 			continue;
 
-		wma_debug("Reaper: freeing stale desc_id=%u age=%llu us fc=0x%02x/0x%02x",
+		wma_debug("Reaper: freeing%s desc_id=%u age=%llu us fc=0x%02x/0x%02x",
+			  force ? " (forced)" : "",
 			  e->desc_id, age_us, e->fc_type, e->fc_subtype);
 
 		wma_injection_unmap_tx_buf(e->tx_buf);
@@ -1047,7 +1083,7 @@ static void wma_injection_reaper_work_cb(void *context)
 	if (!ctx->is_initialized)
 		return;
 
-	reaped = wma_injection_reap_stale_nbufs();
+	reaped = wma_injection_reap_stale_nbufs(false);
 
 	if (reaped)
 		wma_info("Reaper: freed %u stale injection nbufs, inflight now %d",
@@ -1271,7 +1307,7 @@ QDF_STATUS wma_queue_injection_frame(tp_wma_handle wma_handle,
 		int inflight = qdf_atomic_read(&ctx->inflight_count);
 
 		if (inflight >= WMA_INJECTION_INFLIGHT_HIGH) {
-			wma_injection_reap_stale_nbufs();
+			wma_injection_reap_stale_nbufs(false);
 			inflight = qdf_atomic_read(&ctx->inflight_count);
 		}
 
@@ -1444,6 +1480,9 @@ QDF_STATUS wma_flush_injection_queue(tp_wma_handle wma_handle)
 	ctx->stats.frames_dropped += flushed_count;
 
 	qdf_spin_unlock_bh(&ctx->queue_lock);
+
+	/* Clean up any timed-out in-flight buffers */
+	wma_injection_reap_stale_nbufs(false);
 
 	wma_info("Flushed %u frames from injection queue", flushed_count);
 
