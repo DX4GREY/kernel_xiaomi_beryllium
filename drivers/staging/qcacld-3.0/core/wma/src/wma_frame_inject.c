@@ -73,31 +73,34 @@ static inline void wma_injection_unmap_tx_buf(qdf_nbuf_t buf)
 #endif
 
 /* Maximum number of frames in WMA injection queue */
-#define WMA_FRAME_INJECT_MAX_QUEUE_SIZE    512
+#define WMA_FRAME_INJECT_MAX_QUEUE_SIZE    1024
 
 /* Maximum frame size for injection */
-#define WMA_FRAME_INJECT_MAX_FRAME_SIZE    2304
+#define WMA_FRAME_INJECT_MAX_FRAME_SIZE    2346
 
 /* Timeout for queue processing work in milliseconds */
-#define WMA_FRAME_INJECT_QUEUE_TIMEOUT_MS  100
+#define WMA_FRAME_INJECT_QUEUE_TIMEOUT_MS  50
 
 /* Reaper timer interval: how often we scan for stale in-flight nbufs (ms) */
-#define WMA_INJECTION_REAPER_INTERVAL_MS   250
+#define WMA_INJECTION_REAPER_INTERVAL_MS   50
 
 /*
- * Maximum age (in microseconds, QDF log-timestamp units) before an
- * in-flight nbuf is considered abandoned by firmware and reaped.
- * Completions on helper STA vdev never arrive, so 400 ms timeout avoids
- * queue starvation while penetration tools inject at high rates.
+ * Maximum age before an in-flight nbuf is considered abandoned by firmware and reaped.
+ * Over-the-air 802.11 mgmt frame transmission finishes DMA in < 1-2 ms. A 50 ms timeout
+ * ensures rapid recycling and eliminates queue starvation/backpressure during sustained injection.
  */
-#define WMA_INJECTION_NBUF_TIMEOUT_US      400000ULL
+#define WMA_INJECTION_NBUF_TIMEOUT_US      50000ULL
 
 /*
- * Maximum number of in-flight (submitted but uncomplemented) nbufs before
- * we start rejecting new enqueue requests.  Keeps DMA-mapped memory bounded
- * when firmware silently drops completions for the helper STA vdev.
+ * Maximum number of in-flight nbufs before backpressure handling.
  */
-#define WMA_INJECTION_INFLIGHT_HIGH        512
+#define WMA_INJECTION_INFLIGHT_HIGH        1024
+
+/* Helper vdev maximum idle duration before keepalive refresh (45 seconds) */
+#define WMA_INJECTION_VDEV_MAX_IDLE_US     45000000ULL
+
+/* Maximum consecutive firmware discards before automatic helper recreation */
+#define WMA_INJECTION_MAX_DISCARDS_BEFORE_RECREATE 3
 
 /**
  * struct wma_injection_queue_node - Node for injection queue
@@ -160,7 +163,7 @@ static bool inject_patch_banner_logged;
  * Keep a small best-effort debug cache so firmware completion status can be
  * correlated with the frame metadata for the corresponding desc_id.
  */
-#define WMA_INJECTION_DEBUG_CACHE_SIZE 1024
+#define WMA_INJECTION_DEBUG_CACHE_SIZE 2048
 struct wma_injection_debug_info {
 	bool valid;
 	uint32_t desc_id;
@@ -205,6 +208,8 @@ struct wma_injection_tx_vdev {
 	uint8_t monitor_vdev_id;
 	uint32_t chanfreq;
 	uint8_t mac_addr[QDF_MAC_ADDR_SIZE];
+	uint64_t last_tx_ts;
+	uint32_t consecutive_discards;
 };
 
 static struct wma_injection_tx_vdev g_inj_tx_vdev;
@@ -305,11 +310,50 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	}
 
 	if (g_inj_tx_vdev.created) {
-		if (g_inj_tx_vdev.chanfreq == chanfreq) {
+		bool need_refresh = false;
+		uint64_t now_ts = qdf_get_log_timestamp();
+
+		/* Check 1: Channel changed */
+		if (g_inj_tx_vdev.chanfreq != chanfreq)
+			need_refresh = true;
+
+		/* Check 2: VDEV ID collision with host interface */
+		if (!need_refresh && g_inj_tx_vdev.vdev_id < wma->max_bssid &&
+		    wma->interfaces[g_inj_tx_vdev.vdev_id].vdev) {
+			wma_info("Injection helper vdev %u claimed by host interface, refreshing",
+				 g_inj_tx_vdev.vdev_id);
+			need_refresh = true;
+		}
+
+		/* Check 3: Consecutive firmware discard errors */
+		if (!need_refresh &&
+		    g_inj_tx_vdev.consecutive_discards >= WMA_INJECTION_MAX_DISCARDS_BEFORE_RECREATE) {
+			wma_info("Injection helper vdev has %u consecutive discards, refreshing",
+				 g_inj_tx_vdev.consecutive_discards);
+			need_refresh = true;
+		}
+
+		/*
+		 * Check 4: Prolonged idle duration
+		 * If interface has been idle for > 45 seconds without reset,
+		 * firmware power save or beacon tracking may have expired the peer.
+		 * Proactively refresh so injection is guaranteed to succeed immediately.
+		 */
+		if (!need_refresh && g_inj_tx_vdev.last_tx_ts) {
+			uint64_t idle_us = qdf_log_timestamp_to_usecs(now_ts - g_inj_tx_vdev.last_tx_ts);
+			if (idle_us > WMA_INJECTION_VDEV_MAX_IDLE_US) {
+				wma_info("Injection helper vdev idle for %llu ms, performing keepalive refresh",
+					 idle_us / 1000);
+				need_refresh = true;
+			}
+		}
+
+		if (!need_refresh) {
 			qdf_mutex_release(&g_inj_tx_vdev_mutex);
 			return QDF_STATUS_SUCCESS;
 		}
-		/* Channel changed – tear down and recreate */
+
+		/* Channel changed or health check failed – tear down and recreate */
 		__wma_injection_destroy_tx_vdev(wma);
 	}
 
@@ -453,6 +497,8 @@ wma_injection_ensure_tx_vdev(tp_wma_handle wma,
 	g_inj_tx_vdev.vdev_id          = vid;
 	g_inj_tx_vdev.monitor_vdev_id  = mon_vdev_id;
 	g_inj_tx_vdev.chanfreq         = chanfreq;
+	g_inj_tx_vdev.last_tx_ts       = qdf_get_log_timestamp();
+	g_inj_tx_vdev.consecutive_discards = 0;
 	qdf_mem_copy(g_inj_tx_vdev.mac_addr, inj_mac, QDF_MAC_ADDR_SIZE);
 
 	wma_info("Injection TX helper vdev created: vdev_id=%u mac=%pM freq=%u type=STA",
@@ -1097,9 +1143,9 @@ static void wma_injection_reaper_work_cb(void *context)
 	reaped = wma_injection_reap_stale_nbufs(false);
 
 	if (reaped)
-		wma_info("Reaper: freed %u stale injection nbufs, inflight now %d",
-			 reaped,
-			 qdf_atomic_read(&g_wma_injection_ctx.inflight_count));
+		wma_debug("Reaper: freed %u stale injection nbufs, inflight now %d",
+			  reaped,
+			  qdf_atomic_read(&g_wma_injection_ctx.inflight_count));
 
 	/* Re-arm the periodic timer */
 	if (ctx->is_initialized)
@@ -1311,13 +1357,19 @@ QDF_STATUS wma_queue_injection_frame(tp_wma_handle wma_handle,
 	/*
 	 * Inflight backpressure: if too many nbufs are waiting for FW
 	 * completions that will never arrive, reap stale entries inline first.
-	 * If still over threshold, reject early to avoid exhausting
-	 * DMA-mapped memory and triggering an SMMU fault.
+	 * If still over threshold, yield briefly to let FW DMA progress,
+	 * then reap once more before dropping.
 	 */
 	{
 		int inflight = qdf_atomic_read(&ctx->inflight_count);
 
 		if (inflight >= WMA_INJECTION_INFLIGHT_HIGH) {
+			wma_injection_reap_stale_nbufs(false);
+			inflight = qdf_atomic_read(&ctx->inflight_count);
+		}
+
+		if (inflight >= WMA_INJECTION_INFLIGHT_HIGH) {
+			usleep_range(500, 1000);
 			wma_injection_reap_stale_nbufs(false);
 			inflight = qdf_atomic_read(&ctx->inflight_count);
 		}
@@ -1745,6 +1797,7 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	status = wmi_mgmt_unified_cmd_send(wma_handle->wmi_handle, &mgmt_params);
 	if (!QDF_IS_STATUS_ERROR(status)) {
 		wmi_tx_ok = true;
+		g_inj_tx_vdev.last_tx_ts = qdf_get_log_timestamp();
 		/*
 		 * LL path: firmware DMA-reads from the nbuf we passed as
 		 * tx_frame.  Track it so the completion handler can unmap
@@ -1764,6 +1817,9 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	} else {
 		wma_warn("WMI management TX command failed: %d (service=%u)",
 			 status, wmi_mgmt_service ? 1 : 0);
+		qdf_mutex_acquire(&g_inj_tx_vdev_mutex);
+		__wma_injection_destroy_tx_vdev(wma_handle);
+		qdf_mutex_release(&g_inj_tx_vdev_mutex);
 	}
 
 	if (!wmi_tx_ok) {
@@ -1797,13 +1853,18 @@ QDF_STATUS wma_handle_injection_fw_response(tp_wma_handle wma_handle,
 	switch (status) {
 	case WMI_MGMT_TX_COMP_TYPE_COMPLETE_OK:
 		status_str = "SUCCESS";
+		g_inj_tx_vdev.last_tx_ts = qdf_get_log_timestamp();
+		g_inj_tx_vdev.consecutive_discards = 0;
 		break;
 	case WMI_MGMT_TX_COMP_TYPE_DISCARD:
 		status_str = "DISCARDED";
 		ctx->stats.frames_dropped++;
+		g_inj_tx_vdev.consecutive_discards++;
 		break;
 	case WMI_MGMT_TX_COMP_TYPE_COMPLETE_NO_ACK:
 		status_str = "NO_ACK";
+		g_inj_tx_vdev.last_tx_ts = qdf_get_log_timestamp();
+		g_inj_tx_vdev.consecutive_discards = 0;
 		break;
 	case WMI_MGMT_TX_COMP_TYPE_INSPECT:
 		status_str = "INSPECT";
