@@ -155,6 +155,7 @@
 #ifdef FEATURE_FRAME_INJECTION_SUPPORT
 #include "wlan_hdd_frame_inject.h"
 #endif
+#include "wlan_hdd_rx_monitor.h"
 #include <qdf_hang_event_notifier.h>
 #include "hif.h"
 #include "wlan_hdd_ioctl.h"
@@ -705,6 +706,19 @@ static const struct ieee80211_iface_limit
 	},
 };
 
+/* STA + Monitor combination */
+static const struct ieee80211_iface_limit
+wlan_hdd_sta_mon_iface_limit[] = {
+	{
+		.max = 1,
+		.types = BIT(NL80211_IFTYPE_STATION),
+	},
+	{
+		.max = 1,
+		.types = BIT(NL80211_IFTYPE_MONITOR),
+	},
+};
+
 static struct ieee80211_iface_combination
 	wlan_hdd_iface_combination[] = {
 	/* STA */
@@ -796,6 +810,13 @@ static struct ieee80211_iface_combination
 		.max_interfaces = 3,
 		.num_different_channels = 2,
 		.n_limits = ARRAY_SIZE(wlan_hdd_mon_iface_limit),
+	},
+	/* STA + Monitor */
+	{
+		.limits = wlan_hdd_sta_mon_iface_limit,
+		.max_interfaces = 2,
+		.num_different_channels = 2,
+		.n_limits = ARRAY_SIZE(wlan_hdd_sta_mon_iface_limit),
 	},
 };
 
@@ -17351,6 +17372,15 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 			}
 
 			hdd_set_ap_ops(adapter->dev);
+		} else if (new_mode == QDF_MONITOR_MODE) {
+			hdd_stop_adapter(hdd_ctx, adapter);
+			hdd_deinit_adapter(hdd_ctx, adapter, true);
+			memset(&adapter->session, 0, sizeof(adapter->session));
+			adapter->device_mode = QDF_MONITOR_MODE;
+			adapter->dev->type = ARPHRD_IEEE80211_RADIOTAP;
+#ifdef FEATURE_MONITOR_MODE_SUPPORT
+			hdd_set_monitor_ops(adapter->dev);
+#endif
 		} else {
 			hdd_err("Changing to device mode '%s' is not supported",
 				qdf_opmode_str(new_mode));
@@ -17375,6 +17405,23 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 			errno = -EOPNOTSUPP;
 			goto err;
 		}
+	} else if (adapter->device_mode == QDF_MONITOR_MODE) {
+		if (hdd_is_client_mode(new_mode)) {
+#ifdef FEATURE_MONITOR_MODE_SUPPORT
+			hdd_disable_monitor_mode(adapter->dev);
+#endif
+			hdd_stop_adapter(hdd_ctx, adapter);
+			hdd_deinit_adapter(hdd_ctx, adapter, true);
+			memset(&adapter->session, 0, sizeof(adapter->session));
+			adapter->device_mode = new_mode;
+			adapter->dev->type = ARPHRD_ETHER;
+			hdd_set_station_ops(adapter->dev);
+		} else {
+			hdd_err("Changing from monitor to '%s' is not supported",
+				qdf_opmode_str(new_mode));
+			errno = -EOPNOTSUPP;
+			goto err;
+		}
 	} else {
 		hdd_err("Changing from device mode '%s' is not supported",
 			qdf_opmode_str(adapter->device_mode));
@@ -17389,6 +17436,22 @@ static int __wlan_hdd_cfg80211_change_iface(struct wiphy *wiphy,
 			hdd_err("Failed to start adapter");
 			errno = -EINVAL;
 			goto err;
+		}
+
+		if (adapter->device_mode == QDF_MONITOR_MODE) {
+#ifdef FEATURE_MONITOR_MODE_SUPPORT
+			errno = hdd_set_mon_rx_cb(adapter->dev);
+			if (!errno)
+				errno = hdd_enable_monitor_mode(adapter->dev);
+			if (errno) {
+				hdd_err("Failed to enable monitor mode: %d", errno);
+				goto err;
+			}
+			set_bit(DEVICE_IFACE_OPENED, &adapter->event_flags);
+			wlan_hdd_netif_queue_control(adapter,
+						     WLAN_START_ALL_NETIF_QUEUE_N_CARRIER,
+						     WLAN_CONTROL_PATH);
+#endif
 		}
 	}
 
@@ -24158,12 +24221,12 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	}
 	sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(adapter);
 	ch_info = &sta_ctx->ch_info;
+	roam_profile.ch_params.ch_width = ch_width;
+	hdd_mon_select_cbmode(adapter, chandef->chan->center_freq,
+			      &roam_profile.ch_params);
 	roam_profile.ChannelInfo.freq_list = &ch_info->freq;
 	roam_profile.ChannelInfo.numOfChannels = 1;
 	roam_profile.phyMode = ch_info->phy_mode;
-	roam_profile.ch_params.ch_width = ch_width;
-	hdd_select_cbmode(adapter, chandef->chan->center_freq,
-			  &roam_profile.ch_params);
 
 	qdf_mem_copy(bssid.bytes, adapter->mac_addr.bytes,
 		     QDF_MAC_ADDR_SIZE);
@@ -24172,6 +24235,17 @@ static int __wlan_hdd_cfg80211_set_mon_ch(struct wiphy *wiphy,
 	wlan_reg_set_channel_params_for_freq(hdd_ctx->pdev,
 					     chandef->chan->center_freq,
 					     0, &ch_params);
+
+	{
+		struct hdd_adapter *sta_adapter = hdd_get_adapter(hdd_ctx, QDF_STA_MODE);
+		if (sta_adapter && test_bit(DEVICE_IFACE_OPENED, &sta_adapter->event_flags)) {
+			adapter->mon_chan_freq = chandef->chan->center_freq;
+			adapter->mon_bandwidth = ch_width;
+			hdd_info("Monitor channel set to %d (concurrent with active STA)",
+				 chandef->chan->center_freq);
+			return 0;
+		}
+	}
 
 	if (wlan_hdd_change_hw_mode_for_given_chnl(adapter,
 						   chandef->chan->center_freq,

@@ -70,7 +70,7 @@ struct injection_session {
  */
 static uint64_t hdd_get_current_time_ms(void)
 {
-	return qdf_get_log_timestamp();
+	return (uint64_t)qdf_mc_timer_get_system_time();
 }
 
 /**
@@ -321,6 +321,11 @@ QDF_STATUS hdd_apply_injection_rate_limit(struct hdd_adapter *adapter)
 	current_time = hdd_get_current_time_ms();
 	max_rate = security_ctx->config.max_frame_rate;
 	window_ms = security_ctx->config.rate_window_ms;
+
+	/* If max_rate is 0 or monitor mode is active, rate limiting is disabled */
+	if (max_rate == 0 || adapter->device_mode == QDF_MONITOR_MODE ||
+	    adapter->injection_ctx->is_monitor_mode)
+		return QDF_STATUS_SUCCESS;
 
 	hdd_security_debug("Applying rate limit: current_time=%llu, max_rate=%u, window=%u",
 			   current_time, max_rate, window_ms);

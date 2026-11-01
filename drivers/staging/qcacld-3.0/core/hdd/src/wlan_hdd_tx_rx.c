@@ -1027,6 +1027,57 @@ static void hdd_monitor_mode_tx_inject(struct hdd_adapter *adapter,
 	req->tx_flags = 0;
 	req->retry_count = 0;
 	req->tx_rate = 0;
+
+	{
+		uint32_t chanfreq = 0;
+
+		if (has_radiotap && rtap_len >= 8) {
+			uint32_t present = le32_to_cpup((__le32 *)(skb->data + 4));
+			uint8_t *pos = skb->data + 8;
+
+			while ((present & (1U << 31)) && pos + 4 <= skb->data + rtap_len) {
+				present = le32_to_cpup((__le32 *)pos);
+				pos += 4;
+			}
+
+			if (present & (1U << 0)) {
+				pos = (uint8_t *)ALIGN((uintptr_t)pos, 8);
+				pos += 8;
+			}
+			if (present & (1U << 1))
+				pos += 1;
+			if (present & (1U << 2))
+				pos += 1;
+			if (present & (1U << 3)) {
+				pos = (uint8_t *)ALIGN((uintptr_t)pos, 2);
+				if (pos + 2 <= skb->data + rtap_len)
+					chanfreq = (uint32_t)le16_to_cpup((__le16 *)pos);
+			}
+		}
+
+		if (!chanfreq && adapter->mon_chan_freq)
+			chanfreq = adapter->mon_chan_freq;
+
+		if (!chanfreq) {
+			struct hdd_context *hdd_ctx = WLAN_HDD_GET_CTX(adapter);
+			if (hdd_ctx) {
+				struct hdd_adapter *mon_adapter =
+					hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE);
+				if (mon_adapter && mon_adapter->mon_chan_freq)
+					chanfreq = mon_adapter->mon_chan_freq;
+				else {
+					struct hdd_adapter *sta_adapter =
+						hdd_get_adapter(hdd_ctx, QDF_STA_MODE);
+					if (sta_adapter && test_bit(DEVICE_IFACE_OPENED,
+								    &sta_adapter->event_flags))
+						chanfreq = sta_adapter->session.station.conn_info.chan_freq;
+				}
+			}
+		}
+
+		req->chanfreq = chanfreq;
+	}
+
 	req->timestamp = now;
 	req->session_id = current->pid ? (uint32_t)current->pid : 1;
 	req->submit_time = now;
@@ -1559,6 +1610,91 @@ QDF_STATUS hdd_deinit_tx_rx(struct hdd_adapter *adapter)
 }
 
 #ifdef FEATURE_MONITOR_MODE_SUPPORT
+static void hdd_deliver_cloned_to_monitor(struct hdd_adapter *sta_adapter,
+					  struct hdd_adapter *mon_adapter,
+					  struct sk_buff *skb,
+					  unsigned int cpu_index)
+{
+	struct sk_buff *mon_skb;
+	struct ethhdr *eh;
+	uint8_t da[ETH_ALEN], sa[ETH_ALEN], bssid[ETH_ALEN];
+	__be16 eth_type;
+	uint8_t rtap_80211_hdr[8 + 24 + 8];
+	int total_hdr_len = 8 + 24 + 8; /* 40 bytes: 8 radiotap + 24 802.11 + 8 LLC */
+
+	if (!mon_adapter || !mon_adapter->dev || skb->len < ETH_HLEN)
+		return;
+
+	eh = (struct ethhdr *)skb->data;
+	memcpy(da, eh->h_dest, ETH_ALEN);
+	memcpy(sa, eh->h_source, ETH_ALEN);
+	eth_type = eh->h_proto;
+
+	if (is_zero_ether_addr(sta_adapter->session.station.conn_info.bssid.bytes))
+		memcpy(bssid, sta_adapter->mac_addr.bytes, ETH_ALEN);
+	else
+		memcpy(bssid, sta_adapter->session.station.conn_info.bssid.bytes, ETH_ALEN);
+
+	/* Copy skb with 40 bytes extra headroom */
+	mon_skb = skb_copy_expand(skb, total_hdr_len, 0, GFP_ATOMIC);
+	if (!mon_skb)
+		return;
+
+	/* Strip 14 bytes ethernet header */
+	skb_pull(mon_skb, ETH_HLEN);
+
+	/* Prepare Radiotap Header (8 bytes): version=0, pad=0, len=8, present=0 */
+	memset(rtap_80211_hdr, 0, sizeof(rtap_80211_hdr));
+	rtap_80211_hdr[0] = 0; /* version */
+	rtap_80211_hdr[1] = 0; /* pad */
+	rtap_80211_hdr[2] = 8; /* it_len (LE16) */
+	rtap_80211_hdr[3] = 0;
+	/* it_present = 0 */
+
+	/* Prepare 802.11 Data Header (24 bytes):
+	 * FC: 0x0108 (Data frame, FromDS=1, ToDS=0)
+	 * Duration: 0
+	 * Addr1 (RA/DA): Destination MAC
+	 * Addr2 (TA/BSSID): AP BSSID
+	 * Addr3 (SA): Source MAC
+	 * Seq: 0
+	 */
+	rtap_80211_hdr[8] = 0x08;  /* Data frame */
+	rtap_80211_hdr[9] = 0x02;  /* FromDS = 1 */
+	rtap_80211_hdr[10] = 0;    /* Duration */
+	rtap_80211_hdr[11] = 0;
+	memcpy(&rtap_80211_hdr[12], da, ETH_ALEN);
+	memcpy(&rtap_80211_hdr[18], bssid, ETH_ALEN);
+	memcpy(&rtap_80211_hdr[24], sa, ETH_ALEN);
+	rtap_80211_hdr[30] = 0;
+	rtap_80211_hdr[31] = 0;
+
+	/* LLC/SNAP Header (8 bytes):
+	 * DSAP: 0xAA, SSAP: 0xAA, Ctrl: 0x03, OUI: 0x00 0x00 0x00, EtherType
+	 */
+	rtap_80211_hdr[32] = 0xAA;
+	rtap_80211_hdr[33] = 0xAA;
+	rtap_80211_hdr[34] = 0x03;
+	rtap_80211_hdr[35] = 0x00;
+	rtap_80211_hdr[36] = 0x00;
+	rtap_80211_hdr[37] = 0x00;
+	memcpy(&rtap_80211_hdr[38], &eth_type, 2);
+
+	/* Prepend the full 40-byte Radiotap + 802.11 + LLC/SNAP header */
+	skb_push(mon_skb, total_hdr_len);
+	memcpy(mon_skb->data, rtap_80211_hdr, total_hdr_len);
+
+	mon_skb->dev = mon_adapter->dev;
+	mon_skb->pkt_type = PACKET_OTHERHOST;
+	mon_skb->protocol = htons(ETH_P_802_2);
+	skb_reset_mac_header(mon_skb);
+
+	++mon_adapter->hdd_stats.tx_rx_stats.rx_packets[cpu_index];
+	++mon_adapter->stats.rx_packets;
+	mon_adapter->stats.rx_bytes += mon_skb->len;
+	netif_rx_ni(mon_skb);
+}
+
 /**
  * hdd_mon_rx_packet_cbk() - Receive callback registered with OL layer.
  * @context: [in] pointer to qdf context
@@ -1599,6 +1735,9 @@ static QDF_STATUS hdd_mon_rx_packet_cbk(void *context, qdf_nbuf_t rxbuf)
 	while (skb) {
 		skb_next = skb->next;
 		skb->dev = adapter->dev;
+		skb->pkt_type = PACKET_OTHERHOST;
+		skb->protocol = htons(ETH_P_802_2);
+		skb_reset_mac_header(skb);
 
 		++adapter->hdd_stats.tx_rx_stats.rx_packets[cpu_index];
 		++adapter->stats.rx_packets;
@@ -2519,6 +2658,37 @@ QDF_STATUS hdd_rx_packet_cbk(void *adapter_context,
 		}
 
 		skb->dev = adapter->dev;
+		if (unlikely(adapter->device_mode == QDF_MONITOR_MODE ||
+			     adapter->dev->type == ARPHRD_IEEE80211_RADIOTAP)) {
+			skb->pkt_type = PACKET_OTHERHOST;
+			skb->protocol = htons(ETH_P_802_2);
+			skb_reset_mac_header(skb);
+			++adapter->hdd_stats.tx_rx_stats.rx_packets[cpu_index];
+			++adapter->stats.rx_packets;
+			adapter->stats.rx_bytes += skb->len;
+			qdf_net_buf_debug_release_skb(skb);
+			if (netif_rx_ni(skb) == NET_RX_SUCCESS)
+				++adapter->hdd_stats.tx_rx_stats.rx_delivered[cpu_index];
+			else
+				++adapter->hdd_stats.tx_rx_stats.rx_refused[cpu_index];
+			continue;
+		}
+
+#ifdef FEATURE_MONITOR_MODE_SUPPORT
+		if (adapter->device_mode == QDF_STA_MODE) {
+			struct hdd_adapter *mon_adapter =
+				hdd_get_adapter(hdd_ctx, QDF_MONITOR_MODE);
+
+			if (mon_adapter &&
+			    test_bit(DEVICE_IFACE_OPENED, &mon_adapter->event_flags)) {
+				hdd_deliver_cloned_to_monitor(adapter,
+							      mon_adapter,
+							      skb,
+							      cpu_index);
+			}
+		}
+#endif
+
 		skb->protocol = eth_type_trans(skb, skb->dev);
 		++adapter->hdd_stats.tx_rx_stats.rx_packets[cpu_index];
 		++adapter->stats.rx_packets;
@@ -3133,6 +3303,9 @@ int hdd_set_mon_rx_cb(struct net_device *dev)
 	if (QDF_STATUS_SUCCESS != qdf_status) {
 		hdd_err("cdp_peer_register() failed to register. Status= %d [0x%08X]",
 			qdf_status, qdf_status);
+	} else {
+		cdp_peer_state_update(soc, adapter->mac_addr.bytes,
+				      OL_TXRX_PEER_STATE_AUTH);
 	}
 
 exit:

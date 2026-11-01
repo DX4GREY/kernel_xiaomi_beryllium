@@ -1577,10 +1577,13 @@ ol_rx_in_order_indication_handler(ol_txrx_pdev_handle pdev,
 	}
 
 	if (pdev) {
-		if (qdf_unlikely(QDF_GLOBAL_MONITOR_MODE == cds_get_conparam()))
+		if (qdf_unlikely(QDF_GLOBAL_MONITOR_MODE == cds_get_conparam())) {
 			peer = pdev->self_peer;
-		else
+		} else {
 			peer = ol_txrx_peer_find_by_id(pdev, peer_id);
+			if (!peer && pdev->monitor_vdev)
+				peer = pdev->self_peer;
+		}
 		htt_pdev = pdev->htt_pdev;
 	} else {
 		ol_txrx_err("Invalid pdev passed!");

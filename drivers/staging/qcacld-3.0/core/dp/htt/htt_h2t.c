@@ -534,7 +534,7 @@ QDF_STATUS htt_h2t_rx_ring_cfg_msg_ll(struct htt_pdev_t *pdev)
 	enable_ppdu_start = 0;
 	enable_ppdu_end = 0;
 #endif
-	if (QDF_GLOBAL_MONITOR_MODE == cds_get_conparam()) {
+	if (QDF_GLOBAL_MONITOR_MODE == cds_get_conparam() || 1) {
 		enable_ctrl_data  = 1;
 		enable_mgmt_data  = 1;
 		enable_null_data  = 1;

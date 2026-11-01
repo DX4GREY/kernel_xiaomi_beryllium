@@ -2657,6 +2657,7 @@ QDF_STATUS hdd_stop_adapter(struct hdd_context *hdd_ctx,
 			    struct hdd_adapter *adapter);
 
 void hdd_set_station_ops(struct net_device *dev);
+void hdd_set_monitor_ops(struct net_device *dev);
 
 /**
  * wlan_hdd_get_intf_addr() - Get address for the interface
@@ -4622,7 +4623,7 @@ QDF_STATUS hdd_common_roam_callback(struct wlan_objmgr_psoc *psoc,
 				    eRoamCmdStatus roam_status,
 				    eCsrRoamResult roam_result);
 
-#ifdef WLAN_FEATURE_PKT_CAPTURE
+#if defined(WLAN_FEATURE_PKT_CAPTURE) || defined(FEATURE_MONITOR_MODE_SUPPORT)
 
 /**
  * wlan_hdd_is_session_type_monitor() - check if session type is MONITOR
