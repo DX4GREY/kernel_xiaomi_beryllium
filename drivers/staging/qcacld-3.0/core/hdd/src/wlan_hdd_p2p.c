@@ -676,6 +676,7 @@ struct wireless_dev *__wlan_hdd_add_virtual_intf(struct wiphy *wiphy,
 	case QDF_P2P_GO_MODE:
 	case QDF_P2P_CLIENT_MODE:
 	case QDF_STA_MODE:
+	case QDF_MONITOR_MODE:
 		break;
 	default:
 		mode = QDF_STA_MODE;
@@ -863,8 +864,8 @@ int __wlan_hdd_del_virtual_intf(struct wiphy *wiphy, struct wireless_dev *wdev)
 	if (adapter->device_mode == QDF_SAP_MODE &&
 	    wlan_sap_is_pre_cac_active(hdd_ctx->mac_handle)) {
 		hdd_clean_up_pre_cac_interface(hdd_ctx);
-	} else if (wlan_hdd_is_session_type_monitor(
-					adapter->device_mode)) {
+	} else if (adapter->device_mode == QDF_MONITOR_MODE ||
+		   wlan_hdd_is_session_type_monitor(adapter->device_mode)) {
 		wlan_hdd_del_monitor(hdd_ctx, adapter, TRUE);
 		hdd_reset_pktcapture_cb(OL_TXRX_PDEV_ID);
 	} else {

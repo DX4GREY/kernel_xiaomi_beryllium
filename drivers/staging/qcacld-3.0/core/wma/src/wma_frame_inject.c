@@ -724,6 +724,7 @@ wma_injection_queue_node_alloc(struct inject_frame_req *req, uint8_t vdev_id)
 	node->req.tx_flags = req->tx_flags;
 	node->req.retry_count = req->retry_count;
 	node->req.tx_rate = req->tx_rate;
+	node->req.chanfreq = req->chanfreq;
 	node->req.timestamp = req->timestamp;
 	node->req.session_id = req->session_id;
 	node->timestamp = qdf_get_log_timestamp();
@@ -932,6 +933,15 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 		status = wma_send_injection_frame_to_fw(wma_handle, &node->req, node->vdev_id);
 		if (QDF_IS_STATUS_SUCCESS(status)) {
 			ctx->stats.frames_processed++;
+		} else if ((status == QDF_STATUS_E_AGAIN || status == QDF_STATUS_E_RESOURCES) &&
+			   node->req.retry_count < 3) {
+			node->req.retry_count++;
+			qdf_spin_lock_bh(&ctx->queue_lock);
+			qdf_list_insert_back(&ctx->queue, &node->node);
+			ctx->queue_size++;
+			qdf_spin_unlock_bh(&ctx->queue_lock);
+			node = NULL;
+			msleep(10);
 		} else {
 			ctx->stats.frames_dropped++;
 			wma_err("Failed to send injection frame to firmware: %d", status);
@@ -939,8 +949,9 @@ QDF_STATUS wma_process_injection_queue(tp_wma_handle wma_handle)
 
 		processed_count++;
 
-		/* Free the node */
-		wma_injection_queue_node_free(node);
+		/* Free the node if not re-queued */
+		if (node)
+			wma_injection_queue_node_free(node);
 	}
 
 	wma_debug("Injection queue processing cycle complete: processed=%u, deferred=%u",
@@ -1547,7 +1558,9 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 		}
 	}
 
-	if (vdev_id < wma_handle->max_bssid && wma_handle->interfaces[vdev_id].mhz)
+	if (req->chanfreq)
+		tx_chanfreq = req->chanfreq;
+	else if (vdev_id < wma_handle->max_bssid && wma_handle->interfaces[vdev_id].mhz)
 		tx_chanfreq = wma_handle->interfaces[vdev_id].mhz;
 
 	if (!tx_chanfreq) {
@@ -1645,17 +1658,10 @@ QDF_STATUS wma_send_injection_frame_to_fw(tp_wma_handle wma_handle,
 	 */
 	mgmt_params.tx_type = GENERIC_NODOWLOAD_ACK_COMP_INDEX;
 	/*
-	 * Align with regular host management TX behavior:
-	 * probe request uses chanfreq=0 while action/auth/probe-rsp can carry
-	 * an explicit channel.
+	 * Explicit channel frequency for injected frames ensures the firmware
+	 * transmits on the intended target channel.
 	 */
-	mgmt_params.chanfreq = is_probe_req ? 0 : tx_chanfreq;
-	/*
-	 * For monitor vdev probe injection, prefer explicit channel in command
-	 * so firmware can bind probe request tx to the current monitor channel.
-	 */
-	if (monitor_vdev && is_probe_req && tx_chanfreq)
-		mgmt_params.chanfreq = tx_chanfreq;
+	mgmt_params.chanfreq = tx_chanfreq;
 	mgmt_params.desc_id = wma_injection_desc_id_alloc();
 	mgmt_params.pdata = frame_data; /* Management frame bytes for command payload */
 	mgmt_params.macaddr = NULL; /* No specific MAC address */

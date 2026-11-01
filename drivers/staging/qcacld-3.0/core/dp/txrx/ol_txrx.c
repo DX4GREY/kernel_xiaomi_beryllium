@@ -1992,7 +1992,8 @@ ol_txrx_vdev_attach(struct cdp_soc_t *soc_hdl, uint8_t pdev_id,
 
 	/* add this vdev into the pdev's list */
 	TAILQ_INSERT_TAIL(&pdev->vdev_list, vdev, vdev_list_elem);
-	if (QDF_GLOBAL_MONITOR_MODE == cds_get_conparam())
+	if (QDF_GLOBAL_MONITOR_MODE == cds_get_conparam() ||
+	    op_mode == wlan_op_mode_monitor)
 		pdev->monitor_vdev = vdev;
 
 	ol_txrx_hl_tdls_flag_reset(soc_hdl, vdev_id, false);
@@ -2201,6 +2202,8 @@ ol_txrx_vdev_detach(struct cdp_soc_t *soc_hdl, uint8_t vdev_id,
 
 	/* remove the vdev from its parent pdev's list */
 	TAILQ_REMOVE(&pdev->vdev_list, vdev, vdev_list_elem);
+	if (pdev->monitor_vdev == vdev)
+		pdev->monitor_vdev = NULL;
 
 	/*
 	 * Use peer_ref_mutex while accessing peer_list, in case
@@ -2551,7 +2554,8 @@ ol_txrx_peer_attach(struct cdp_soc_t *soc_hdl, uint8_t vdev_id,
 #ifdef QCA_SUPPORT_PEER_DATA_RX_RSSI
 	peer->rssi_dbm = HTT_RSSI_INVALID;
 #endif
-	if ((QDF_GLOBAL_MONITOR_MODE == cds_get_conparam()) &&
+	if ((QDF_GLOBAL_MONITOR_MODE == cds_get_conparam() ||
+	     vdev == pdev->monitor_vdev) &&
 	    !pdev->self_peer) {
 		pdev->self_peer = peer;
 		/*
@@ -3353,8 +3357,7 @@ int ol_txrx_peer_release_ref(ol_txrx_peer_handle peer,
 
 		ol_txrx_dump_peer_access_list(peer);
 
-		if (QDF_GLOBAL_MONITOR_MODE == cds_get_conparam() &&
-		    pdev->self_peer == peer)
+		if (pdev->self_peer == peer)
 			pdev->self_peer = NULL;
 
 		qdf_mem_free(peer);
@@ -4965,8 +4968,9 @@ static void ol_rx_data_handler(struct ol_txrx_pdev_t *pdev,
 		goto free_buf;
 
 	qdf_spin_lock_bh(&peer->peer_info_lock);
-	if (qdf_unlikely(!(peer->state >= OL_TXRX_PEER_STATE_CONN) ||
-					 !peer->vdev->rx)) {
+	if (qdf_unlikely((!(peer->state >= OL_TXRX_PEER_STATE_CONN) &&
+			  peer->vdev != pdev->monitor_vdev) ||
+			 !peer->vdev->rx)) {
 		qdf_spin_unlock_bh(&peer->peer_info_lock);
 		ol_txrx_peer_release_ref(peer, PEER_DEBUG_ID_OL_RX_THREAD);
 		goto free_buf;
@@ -5130,7 +5134,8 @@ void ol_rx_data_process(struct ol_txrx_peer_t *peer,
 	qdf_assert(peer->vdev);
 
 	qdf_spin_lock_bh(&peer->peer_info_lock);
-	if (peer->state >= OL_TXRX_PEER_STATE_CONN)
+	if (peer->state >= OL_TXRX_PEER_STATE_CONN ||
+	    peer->vdev == pdev->monitor_vdev)
 		data_rx = peer->vdev->rx;
 	qdf_spin_unlock_bh(&peer->peer_info_lock);
 
@@ -5664,6 +5669,9 @@ uint8_t ol_txrx_get_mon_vdev_from_pdev(struct cdp_soc_t *soc_hdl,
 	ol_txrx_pdev_handle pdev = ol_txrx_get_pdev_from_pdev_id(soc, pdev_id);
 
 	if (qdf_unlikely(!pdev))
+		return -EINVAL;
+
+	if (!pdev->monitor_vdev)
 		return -EINVAL;
 
 	return pdev->monitor_vdev->vdev_id;

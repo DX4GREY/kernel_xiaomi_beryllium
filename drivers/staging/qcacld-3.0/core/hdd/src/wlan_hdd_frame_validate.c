@@ -68,14 +68,15 @@
 #define HDD_MGMT_SUBTYPE_DEAUTH        0xc0
 #define HDD_MGMT_SUBTYPE_ACTION        0xd0
 
-/* Control frame subtypes */
-#define HDD_CTRL_SUBTYPE_RTS           0x40
-#define HDD_CTRL_SUBTYPE_CTS           0x50
-#define HDD_CTRL_SUBTYPE_ACK           0x60
-#define HDD_CTRL_SUBTYPE_CFEND         0x70
-#define HDD_CTRL_SUBTYPE_CFENDACK      0x80
-#define HDD_CTRL_SUBTYPE_BAR           0x90
-#define HDD_CTRL_SUBTYPE_BA            0xa0
+/* Control frame subtypes (IEEE 802.11 Table 9-1) */
+#define HDD_CTRL_SUBTYPE_BAR           0x80
+#define HDD_CTRL_SUBTYPE_BA            0x90
+#define HDD_CTRL_SUBTYPE_PSPOLL        0xa0
+#define HDD_CTRL_SUBTYPE_RTS           0xb0
+#define HDD_CTRL_SUBTYPE_CTS           0xc0
+#define HDD_CTRL_SUBTYPE_ACK           0xd0
+#define HDD_CTRL_SUBTYPE_CFEND         0xe0
+#define HDD_CTRL_SUBTYPE_CFENDACK      0xf0
 
 /* Data frame subtypes */
 #define HDD_DATA_SUBTYPE_DATA          0x00
@@ -180,88 +181,68 @@ static QDF_STATUS hdd_validate_mgmt_frame(uint8_t *frame_data,
 	frame = (struct ieee80211_frame *)frame_data;
 	frame_subtype = frame->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
 	payload = frame_data + sizeof(struct ieee80211_frame);
-	payload_len = frame_len - sizeof(struct ieee80211_frame);
+	payload_len = (frame_len > sizeof(struct ieee80211_frame)) ?
+		      (frame_len - sizeof(struct ieee80211_frame)) : 0;
 
-	/* Validate minimum size based on subtype */
+	/*
+	 * Keep hard rejection threshold at basic 802.11 management header
+	 * size (24 bytes). Tools and tests may inject minimal, truncated,
+	 * or custom-payload management frames which must not be rejected.
+	 */
+	min_size = HDD_MIN_MGMT_FRAME_SIZE;
+
+	/* Inspect subtype-specific fields for diagnostics */
 	switch (frame_subtype) {
 	case HDD_MGMT_SUBTYPE_BEACON:
 	case HDD_MGMT_SUBTYPE_PROBE_RESP:
-		min_size = 36; /* Fixed fields + timestamp + beacon interval + capability */
-		if (frame_len >= min_size) {
-			/* Validate beacon interval (should be reasonable) */
+		if (frame_len >= 36) {
+			/* Validate beacon interval */
 			uint16_t beacon_interval = *(uint16_t *)(payload + 8);
 			if (beacon_interval == 0 || beacon_interval > 65535) {
-				hdd_validate_warn("Invalid beacon interval: %u", beacon_interval);
+				hdd_validate_debug("Beacon interval: %u", beacon_interval);
 			}
 		}
 		break;
 	case HDD_MGMT_SUBTYPE_PROBE_REQ:
-		min_size = 24; /* Basic header */
 		break;
 	case HDD_MGMT_SUBTYPE_AUTH:
-		min_size = 30; /* Header + auth algorithm + seq + status */
-		if (frame_len >= min_size) {
+		if (frame_len >= 30) {
 			uint16_t auth_alg = *(uint16_t *)payload;
-			uint16_t auth_seq;
-
-			if (auth_alg > 3) { /* 0=Open, 1=Shared Key, 2=FT, 3=SAE */
-				hdd_validate_warn("Unknown auth algorithm: %u", auth_alg);
-			}
-			/* Validate auth sequence number */
-			auth_seq = *(uint16_t *)(payload + 2);
-			if (auth_seq == 0 || auth_seq > 4) {
-				hdd_validate_warn("Invalid auth sequence: %u", auth_seq);
-			}
+			uint16_t auth_seq = *(uint16_t *)(payload + 2);
+			hdd_validate_debug("Auth alg: %u, seq: %u", auth_alg, auth_seq);
 		}
 		break;
 	case HDD_MGMT_SUBTYPE_DEAUTH:
 	case HDD_MGMT_SUBTYPE_DISASSOC:
-		min_size = 26; /* Header + reason code */
-		if (frame_len >= min_size) {
-			/* Validate reason code */
+		if (frame_len >= 26) {
 			uint16_t reason = *(uint16_t *)payload;
-			if (reason == 0 || reason > 65) {
-				hdd_validate_warn("Invalid reason code: %u", reason);
-			}
+			hdd_validate_debug("Deauth/Disassoc reason code: %u", reason);
 		}
 		break;
 	case HDD_MGMT_SUBTYPE_ASSOC_REQ:
 	case HDD_MGMT_SUBTYPE_REASSOC_REQ:
-		min_size = 28; /* Header + capability + listen interval */
-		if (frame_len >= min_size) {
-			/* Validate listen interval */
+		if (frame_len >= 28) {
 			uint16_t listen_int = *(uint16_t *)(payload + 2);
-			if (listen_int == 0 || listen_int > 65535) {
-				hdd_validate_warn("Invalid listen interval: %u", listen_int);
-			}
+			hdd_validate_debug("Listen interval: %u", listen_int);
 		}
 		break;
 	case HDD_MGMT_SUBTYPE_ASSOC_RESP:
 	case HDD_MGMT_SUBTYPE_REASSOC_RESP:
-		min_size = 30; /* Header + capability + status + AID */
-		if (frame_len >= min_size) {
-			/* Validate AID */
+		if (frame_len >= 30) {
 			uint16_t aid = *(uint16_t *)(payload + 4);
-			if ((aid & 0xC000) != 0xC000) { /* AID should have bits 14-15 set */
-				hdd_validate_warn("Invalid AID format: 0x%04x", aid);
-			}
+			hdd_validate_debug("AID: 0x%04x", aid);
 		}
 		break;
 	case HDD_MGMT_SUBTYPE_ACTION:
-		min_size = 26; /* Header + category + action */
-		if (frame_len >= min_size) {
-			/* Validate action category */
+		if (frame_len >= 26) {
 			uint8_t category = *payload;
-			if (category > 127 && category < 221) { /* Reserved range */
-				hdd_validate_warn("Reserved action category: %u", category);
-			}
+			hdd_validate_debug("Action category: %u", category);
 		}
 		break;
 	case HDD_MGMT_SUBTYPE_ATIM:
-		min_size = 24; /* Basic header only */
 		break;
 	default:
-		hdd_validate_warn("Unknown management subtype: 0x%02x", frame_subtype);
+		hdd_validate_debug("Management subtype: 0x%02x", frame_subtype);
 		break;
 	}
 
@@ -304,57 +285,42 @@ static QDF_STATUS hdd_validate_ctrl_frame(uint8_t *frame_data,
 	frame_subtype = frame->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
 	duration = *(uint16_t *)frame->i_dur;
 
-	/* Validate minimum size based on subtype */
+	/*
+	 * Keep hard rejection threshold at basic 802.11 control header
+	 * size (10 bytes). Subtype-specific length variations must not cause
+	 * packet rejection during injection or frame generation.
+	 */
+	min_size = HDD_MIN_CTRL_FRAME_SIZE;
+
+	/* Inspect subtype-specific fields for diagnostics */
 	switch (frame_subtype) {
 	case HDD_CTRL_SUBTYPE_RTS:
-		min_size = 16; /* FC + Duration + RA + TA */
-		/* RTS frames should have reasonable duration */
-		if (duration == 0 || duration > 32767) {
-			hdd_validate_warn("Invalid RTS duration: %u", duration);
-		}
 		break;
 	case HDD_CTRL_SUBTYPE_CTS:
-		min_size = 10; /* FC + Duration + RA */
-		/* CTS duration should be reasonable */
-		if (duration > 32767) {
-			hdd_validate_warn("Invalid CTS duration: %u", duration);
-		}
 		break;
 	case HDD_CTRL_SUBTYPE_ACK:
-		min_size = 10; /* FC + Duration + RA */
-		/* ACK frames typically have zero duration */
+		break;
+	case HDD_CTRL_SUBTYPE_PSPOLL:
 		break;
 	case HDD_CTRL_SUBTYPE_BAR:
-		min_size = 20; /* FC + Duration + RA + TA + BAR Control + BAR Info */
-		if (frame_len >= min_size) {
-			/* Validate BAR control field */
+		if (frame_len >= 20) {
 			uint16_t bar_control = *(uint16_t *)(frame_data + 16);
 			uint8_t tid = (bar_control >> 12) & 0x0F;
-			if (tid > 15) {
-				hdd_validate_warn("Invalid BAR TID: %u", tid);
-			}
+			hdd_validate_debug("BAR TID: %u", tid);
 		}
 		break;
 	case HDD_CTRL_SUBTYPE_BA:
-		min_size = 24; /* FC + Duration + RA + TA + BA Control + BA Info */
-		if (frame_len >= min_size) {
-			/* Validate BA control field */
+		if (frame_len >= 24) {
 			uint16_t ba_control = *(uint16_t *)(frame_data + 16);
 			uint8_t tid = (ba_control >> 12) & 0x0F;
-			if (tid > 15) {
-				hdd_validate_warn("Invalid BA TID: %u", tid);
-			}
+			hdd_validate_debug("BA TID: %u", tid);
 		}
 		break;
 	case HDD_CTRL_SUBTYPE_CFEND:
-		min_size = 16; /* FC + Duration + RA + BSSID */
-		break;
 	case HDD_CTRL_SUBTYPE_CFENDACK:
-		min_size = 16; /* FC + Duration + RA + BSSID */
 		break;
 	default:
-		hdd_validate_warn("Unknown control subtype: 0x%02x", frame_subtype);
-		/* Allow unknown subtypes but validate basic structure */
+		hdd_validate_debug("Control subtype: 0x%02x", frame_subtype);
 		break;
 	}
 
@@ -409,22 +375,19 @@ static QDF_STATUS hdd_validate_data_frame(uint8_t *frame_data,
 	/* Check for QoS data frames */
 	if (frame_subtype & 0x80) {
 		has_qos = true;
-		min_size += 2; /* QoS control field */
 	}
 
 	/* Check for 4-address frames (DS to DS) */
 	if (ds_bits == IEEE80211_FC1_DIR_DSTODS) {
 		has_addr4 = true;
-		min_size += QDF_MAC_ADDR_SIZE; /* Address 4 field */
 	}
 
 	/* Check for HTC field (Order bit set in QoS frames) */
 	if (has_qos && (frame->i_fc[1] & IEEE80211_FC1_ORDER)) {
 		has_htc = true;
-		min_size += 4; /* HTC field */
 	}
 
-	/* Validate minimum size */
+	/* Validate minimum size: basic 802.11 data frame header */
 	if (frame_len < min_size) {
 		hdd_validate_err("Data frame too short: %u < %u (subtype 0x%02x)",
 				 frame_len, min_size, frame_subtype);

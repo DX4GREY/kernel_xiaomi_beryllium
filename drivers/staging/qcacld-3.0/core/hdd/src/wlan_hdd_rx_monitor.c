@@ -64,6 +64,9 @@ void hdd_rx_monitor_callback(ol_osif_vdev_handle context,
 	while (skb) {
 		skb_next = skb->next;
 		skb->dev = adapter->dev;
+		skb->pkt_type = PACKET_OTHERHOST;
+		skb->protocol = htons(ETH_P_802_2);
+		skb_reset_mac_header(skb);
 
 		++adapter->hdd_stats.tx_rx_stats.rx_packets[cpu_index];
 		++adapter->stats.rx_packets;

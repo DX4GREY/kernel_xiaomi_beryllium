@@ -190,6 +190,7 @@ struct inject_frame_req {
 	uint32_t tx_flags;
 	uint8_t retry_count;
 	uint32_t tx_rate;
+	uint32_t chanfreq;
 	uint64_t timestamp;
 	uint32_t session_id;
 	qdf_list_node_t node;
