@@ -322,8 +322,9 @@ QDF_STATUS hdd_apply_injection_rate_limit(struct hdd_adapter *adapter)
 	max_rate = security_ctx->config.max_frame_rate;
 	window_ms = security_ctx->config.rate_window_ms;
 
-	/* If max_rate is 0, rate limiting is disabled */
-	if (max_rate == 0)
+	/* If max_rate is 0 or monitor mode is active, rate limiting is disabled */
+	if (max_rate == 0 || adapter->device_mode == QDF_MONITOR_MODE ||
+	    adapter->injection_ctx->is_monitor_mode)
 		return QDF_STATUS_SUCCESS;
 
 	hdd_security_debug("Applying rate limit: current_time=%llu, max_rate=%u, window=%u",
