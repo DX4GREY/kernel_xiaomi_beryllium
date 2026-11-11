@@ -128,6 +128,22 @@ print_status_bar() {
         anyk_status="${C_GREEN}Installed${C_RESET}"
     fi
 
+    local ko_count=0
+    if [[ -d "${OUT_DIR}" ]]; then
+        ko_count=$(find "${OUT_DIR}" -type f -name "*.ko" 2>/dev/null | wc -l)
+    fi
+    if [[ ${ko_count} -eq 0 && -d "${RELEASE_DIR}/modules" ]]; then
+        ko_count=$(find "${RELEASE_DIR}/modules" -type f -name "*.ko" 2>/dev/null | wc -l)
+    fi
+    if [[ ${ko_count} -eq 0 ]]; then
+        ko_count=$(find "${KERNEL_DIR}" -maxdepth 4 -type f -name "*.ko" ! -path "*/AnyKernel3/*" ! -path "*/build_output/*" 2>/dev/null | wc -l)
+    fi
+
+    local mod_status="${C_YELLOW}None Built${C_RESET}"
+    if [[ ${ko_count} -gt 0 ]]; then
+        mod_status="${C_GREEN}${ko_count} Module(s) Ready (.ko)${C_RESET}"
+    fi
+
     if command -v adb >/dev/null 2>&1; then
         local dev_line
         dev_line=$(adb devices 2>/dev/null | grep -E '\b(device|recovery|sideload|unauthorized)\b' | head -n1 || true)
@@ -161,6 +177,7 @@ print_status_bar() {
     echo -e "  Toolchain  : ${tc_status}"
     echo -e "  Config     : ${cfg_status}"
     echo -e "  Image      : ${img_status}"
+    echo -e "  Modules    : ${mod_status}"
     echo -e "  AnyKernel3 : ${anyk_status}"
     echo -e "  ADB Device : ${adb_status}"
     echo -e "${C_CYAN}--------------------------------------------------------------------------------${C_RESET}"
@@ -331,11 +348,11 @@ setup_make_flags() {
 }
 
 # ------------------------------------------------------------------------------
-# MENU 0: OPEN MENUCONFIG
+# MENU 4: FINE-TUNE IN MENUCONFIG
 # ------------------------------------------------------------------------------
 menu_open_menuconfig() {
     print_header
-    echo -e "${C_BOLD}${C_BLUE}=== [0] Open Menuconfig ===${C_RESET}\n"
+    echo -e "${C_BOLD}${C_BLUE}=== [4] Fine-Tune in Menuconfig (Drivers & Modules) ===${C_RESET}\n"
 
     mkdir -p "${OUT_DIR}"
 
@@ -394,21 +411,27 @@ menu_open_menuconfig() {
                 log_success "Saved to ${CONFIGS_DIR}/custom_saved.config"
             fi
         fi
+
+        echo ""
+        if prompt_confirm "Configuration ready! Proceed to Step [6] Build Kernel & Modules now?" "Y"; then
+            menu_build_kernel
+            return 0
+        fi
     else
         log_error "Failed to launch ${target_cmd}!"
-        log_warn "Please ensure ncurses development libraries are installed (Menu 2: Install Dependencies)."
+        log_warn "Please ensure ncurses development libraries are installed (Step [1] Install Dependencies)."
     fi
 
     press_enter
 }
 
 # ------------------------------------------------------------------------------
-# MENU 1: SETUP TOOLCHAINS
+# MENU 2: SETUP COMPILER & TOOLCHAINS
 # ------------------------------------------------------------------------------
 menu_setup_toolchain() {
     while true; do
         print_header
-        echo -e "${C_BOLD}${C_BLUE}=== [1] Setup Toolchains ===${C_RESET}\n"
+        echo -e "${C_BOLD}${C_BLUE}=== [2] Setup Compiler & Toolchains ===${C_RESET}\n"
         echo -e "Active Toolchain : ${C_GREEN}${TOOLCHAIN_TYPE}${C_RESET}"
         echo -e "Toolchain Path   : ${C_YELLOW}${TOOLCHAIN_PATH}${C_RESET}"
         echo ""
@@ -419,7 +442,7 @@ menu_setup_toolchain() {
         echo "  4) Use System Toolchain (Host Clang/LLVM or GCC)"
         echo "  5) Set Custom Toolchain Directory Manually"
         echo "  6) Verify Current Compiler Status & Version"
-        echo "  0) Done / Return to Main Menu"
+        echo "  0) Done / Proceed"
         echo ""
         echo -en "${C_YELLOW}Select option [0-6]: ${C_RESET}"
         local tc_choice
@@ -446,6 +469,11 @@ menu_setup_toolchain() {
                 press_enter
                 ;;
             0)
+                if [[ ! -f "${OUT_DIR}/.config" ]]; then
+                    if prompt_confirm "Toolchain configured. Proceed to Step [3] Apply Kernel Configuration now?" "Y"; then
+                        menu_apply_config
+                    fi
+                fi
                 break
                 ;;
             *)
@@ -659,11 +687,11 @@ verify_compiler_version() {
 }
 
 # ------------------------------------------------------------------------------
-# MENU 2: INSTALL DEPENDENCIES
+# MENU 1: INSTALL BUILD DEPENDENCIES
 # ------------------------------------------------------------------------------
 menu_install_dependencies() {
     print_header
-    echo -e "${C_BOLD}${C_BLUE}=== [2] Install Dependencies ===${C_RESET}\n"
+    echo -e "${C_BOLD}${C_BLUE}=== [1] Install Build Dependencies ===${C_RESET}\n"
 
     local pkg_manager=""
     if command -v pacman >/dev/null 2>&1; then
@@ -749,11 +777,17 @@ menu_install_dependencies() {
         fi
     fi
 
+    echo ""
+    if prompt_confirm "Dependencies checked! Proceed to Step [2] Setup Compiler & Toolchains now?" "Y"; then
+        menu_setup_toolchain
+        return 0
+    fi
+
     press_enter
 }
 
 # ------------------------------------------------------------------------------
-# MENU 3: APPLY CUSTOM CONFIGURATION
+# MENU 3: APPLY KERNEL CONFIGURATION
 # ------------------------------------------------------------------------------
 apply_base_beryllium_config() {
     mkdir -p "${OUT_DIR}"
@@ -840,7 +874,7 @@ apply_nethunter_config() {
 
 menu_apply_config() {
     print_header
-    echo -e "${C_BOLD}${C_BLUE}=== [3] Apply Custom Configuration ===${C_RESET}\n"
+    echo -e "${C_BOLD}${C_BLUE}=== [3] Apply Kernel Configuration ===${C_RESET}\n"
 
     echo "Step 1: Applying Beryllium Base Configuration..."
     if ! apply_base_beryllium_config; then
@@ -910,11 +944,20 @@ menu_apply_config() {
             ;;
     esac
 
+    echo ""
+    if prompt_confirm "Configuration applied! Fine-tune options in Menuconfig (Step [4])?" "N"; then
+        menu_open_menuconfig
+        return 0
+    elif prompt_confirm "Proceed to Step [6] Build Kernel & Modules now?" "Y"; then
+        menu_build_kernel
+        return 0
+    fi
+
     press_enter
 }
 
 # ------------------------------------------------------------------------------
-# MENU 4: APPLY PATCH
+# MENU 5: MANAGE & APPLY PATCHES
 # ------------------------------------------------------------------------------
 apply_single_patch_file() {
     local target_patch="$1"
@@ -1072,7 +1115,7 @@ import_nethunter_patches() {
 
 menu_apply_patch() {
     print_header
-    echo -e "${C_BOLD}${C_BLUE}=== [4] Apply Patch ===${C_RESET}\n"
+    echo -e "${C_BOLD}${C_BLUE}=== [5] Manage & Apply Patches ===${C_RESET}\n"
 
     mkdir -p "${PATCHES_DIR}"
 
@@ -1241,15 +1284,21 @@ menu_apply_patch() {
             ;;
     esac
 
+    echo ""
+    if prompt_confirm "Patches evaluated! Proceed to Step [6] Build Kernel & Modules now?" "Y"; then
+        menu_build_kernel
+        return 0
+    fi
+
     press_enter
 }
 
 # ------------------------------------------------------------------------------
-# MENU 5: BUILD KERNEL
+# MENU 6: BUILD KERNEL & MODULES
 # ------------------------------------------------------------------------------
 run_compile_kernel() {
     local user_cores="$1"
-    local build_target="Image.gz-dtb"
+    local build_targets="${2:-Image.gz-dtb dtbs modules}"
     user_cores="${user_cores:-$(nproc --all 2>/dev/null || echo 4)}"
 
     # Initialize log file
@@ -1259,6 +1308,7 @@ run_compile_kernel() {
         echo "DEVICE       : ${DEVICE} (${DEVICE_NAME})"
         echo "BRANCH/COMMIT: $(git rev-parse --short HEAD 2>/dev/null || echo 'Unknown')"
         echo "COMPILER     : $(${CC_COMPILER} --version 2>/dev/null | head -n1 || echo 'Clang/GCC')"
+        echo "TARGETS      : ${build_targets}"
         echo "THREADS      : ${user_cores}"
         echo "================================================================================"
     } > "${BUILD_LOG}"
@@ -1270,7 +1320,7 @@ run_compile_kernel() {
 
     local build_success=0
     # Execute make piping to tee with set -o pipefail
-    if make -j"${user_cores}" "${MAKE_FLAGS[@]}" "${build_target}" dtbs 2>&1 | tee -a "${BUILD_LOG}"; then
+    if make -j"${user_cores}" "${MAKE_FLAGS[@]}" ${build_targets} 2>&1 | tee -a "${BUILD_LOG}"; then
         build_success=1
     else
         build_success=0
@@ -1306,6 +1356,36 @@ run_compile_kernel() {
             echo -e "  File Size    : ${C_WHITE}${file_size}${C_RESET}"
             echo -e "  SHA256 Hash  : ${C_DIM}${sha256_hash}${C_RESET}"
             echo -e "  Build Time   : ${C_YELLOW}${el_min}m ${el_sec}s${C_RESET}"
+
+            # Scan and copy all compiled .ko modules
+            local all_kos=()
+            while IFS= read -r -d '' ko_file; do
+                all_kos+=("${ko_file}")
+            done < <(find "${OUT_DIR}" -type f -name "*.ko" -print0 2>/dev/null || true)
+
+            if [[ ${#all_kos[@]} -eq 0 ]]; then
+                while IFS= read -r -d '' ko_file; do
+                    all_kos+=("${ko_file}")
+                done < <(find "${KERNEL_DIR}" -maxdepth 4 -type f -name "*.ko" ! -path "*/AnyKernel3/*" ! -path "*/build_output/*" -print0 2>/dev/null || true)
+            fi
+
+            if [[ ${#all_kos[@]} -gt 0 ]]; then
+                mkdir -p "${RELEASE_DIR}/modules"
+                echo -e "\n  ${C_BOLD}${C_GREEN}Compiled Loadable Modules (${#all_kos[@]} total):${C_RESET}"
+                local idx=1
+                for ko in "${all_kos[@]}"; do
+                    local bname
+                    bname="$(basename "${ko}")"
+                    cp -vf "${ko}" "${RELEASE_DIR}/modules/${bname}" >/dev/null 2>&1
+                    local ksz
+                    ksz=$(du -h "${ko}" | cut -f1)
+                    echo -e "    $((idx))) ${C_WHITE}${bname}${C_RESET} (${ksz}) -> ${C_DIM}${RELEASE_DIR}/modules/${bname}${C_RESET}"
+                    if [[ "${bname}" == "battery_saver.ko" ]]; then
+                        cp -vf "${ko}" "${RELEASE_DIR}/battery_saver.ko" >/dev/null 2>&1
+                    fi
+                    idx=$((idx + 1))
+                done
+            fi
             return 0
         else
             log_error "Compilation succeeded but kernel image was not found in ${OUT_DIR}/arch/arm64/boot/!"
@@ -1323,21 +1403,21 @@ run_compile_kernel() {
 
 menu_build_kernel() {
     print_header
-    echo -e "${C_BOLD}${C_BLUE}=== [5] Build Kernel ===${C_RESET}\n"
+    echo -e "${C_BOLD}${C_BLUE}=== [6] Build Kernel & Modules ===${C_RESET}\n"
 
     # Toolchain verification
     setup_make_flags
     if [[ "${USE_LLVM}" -eq 1 ]]; then
         if ! command -v clang >/dev/null 2>&1; then
             log_error "Clang toolchain not installed or missing from PATH!"
-            log_warn "Please run Menu [1] Setup Toolchains first."
+            log_warn "Please run Step [2] Setup Toolchains first."
             press_enter
             return 0
         fi
     else
         if ! command -v "${CC_COMPILER}" >/dev/null 2>&1; then
             log_error "Compiler ${CC_COMPILER} not found!"
-            log_warn "Please run Menu [1] Setup Toolchains first."
+            log_warn "Please run Step [2] Setup Toolchains first."
             press_enter
             return 0
         fi
@@ -1345,51 +1425,238 @@ menu_build_kernel() {
 
     # Config verification
     if [[ ! -f "${OUT_DIR}/.config" ]]; then
-        log_error "Kernel configuration (${OUT_DIR}/.config) not found!"
-        log_warn "Please run Menu [3] Apply Custom Configuration first."
-        press_enter
-        return 0
+        log_warn "Kernel configuration (${OUT_DIR}/.config) not found!"
+        if prompt_confirm "Apply Beryllium default configuration (Step [3]) now?" "Y"; then
+            apply_base_beryllium_config
+        else
+            press_enter
+            return 0
+        fi
     fi
 
-    # Clean build option
-    if prompt_confirm "Do you want to perform a Clean Build (wipe previous compilation artifacts)?" "N"; then
-        log_info "Cleaning build directory (${OUT_DIR})..."
-        make "${MAKE_FLAGS[@]}" mrproper || true
-        # Re-apply base configuration
-        apply_base_beryllium_config
-    fi
+    echo -e "${C_BOLD}Select Compilation Target:${C_RESET}"
+    echo -e "  ${C_CYAN}1.${C_RESET} Full Build: Kernel Image (Image.gz-dtb) + All Modules (*.ko) + DTBs ${C_GREEN}[Recommended]${C_RESET}"
+    echo -e "  ${C_CYAN}2.${C_RESET} Kernel Image Only (Image.gz-dtb & dtbs)"
+    echo -e "  ${C_CYAN}3.${C_RESET} Loadable Modules Only (*.ko from .config =m)"
+    echo -e "  ${C_CYAN}4.${C_RESET} Clean (mrproper) & Full Rebuild"
+    echo -e "  ${C_CYAN}0.${C_RESET} Return to Main Menu"
+    echo ""
+    echo -en "${C_YELLOW}Select build option [0-4] (default: 1): ${C_RESET}"
+    local b_mode
+    read -r b_mode || true
+    b_mode="${b_mode:-1}"
 
     local cores
     cores="$(nproc --all 2>/dev/null || echo 4)"
-    echo -e "Detected CPU Cores: ${C_GREEN}${cores} Cores${C_RESET}"
-    echo -en "${C_YELLOW}Number of parallel threads to use? (default: ${cores}): ${C_RESET}"
-    local user_cores
-    read -r user_cores || true
-    user_cores="${user_cores:-${cores}}"
 
-    local build_target="Image.gz-dtb"
-    echo ""
-    log_info "Compilation Target : ${C_GREEN}${build_target} dtbs${C_RESET}"
-    log_info "Build Log File     : ${C_YELLOW}${BUILD_LOG}${C_RESET}"
-    log_info "Output Directory   : ${C_CYAN}${OUT_DIR}${C_RESET}"
-    echo ""
+    case "${b_mode}" in
+        1)
+            echo -en "${C_YELLOW}Number of parallel threads to use? (default: ${cores}): ${C_RESET}"
+            local user_cores
+            read -r user_cores || true
+            user_cores="${user_cores:-${cores}}"
 
-    if ! prompt_confirm "Start kernel compilation now?" "Y"; then
-        log_info "Build cancelled by user."
-        press_enter
-        return 0
-    fi
+            if run_compile_kernel "${user_cores}" "Image.gz-dtb dtbs modules"; then
+                echo ""
+                if prompt_confirm "Kernel & modules compiled! Proceed to Step [7] Package into AnyKernel3 Zip now?" "Y"; then
+                    menu_setup_anykernel
+                    return 0
+                fi
+            fi
+            ;;
+        2)
+            echo -en "${C_YELLOW}Number of parallel threads to use? (default: ${cores}): ${C_RESET}"
+            local user_cores
+            read -r user_cores || true
+            user_cores="${user_cores:-${cores}}"
 
-    run_compile_kernel "${user_cores}"
+            if run_compile_kernel "${user_cores}" "Image.gz-dtb dtbs"; then
+                echo ""
+                if prompt_confirm "Kernel image compiled! Proceed to Step [7] Package into AnyKernel3 Zip now?" "Y"; then
+                    menu_setup_anykernel
+                    return 0
+                fi
+            fi
+            ;;
+        3)
+            run_compile_kernel_modules 0
+            if [[ -f "${OUT_DIR}/arch/arm64/boot/Image.gz-dtb" ]]; then
+                echo ""
+                if prompt_confirm "Modules compiled! Repack into AnyKernel3 Zip (Step [7]) now?" "Y"; then
+                    menu_setup_anykernel
+                    return 0
+                fi
+            fi
+            ;;
+        4)
+            log_info "Cleaning build directory (${OUT_DIR})..."
+            make "${MAKE_FLAGS[@]}" mrproper || true
+            apply_base_beryllium_config
+            if run_compile_kernel "${cores}" "Image.gz-dtb dtbs modules"; then
+                echo ""
+                if prompt_confirm "Clean rebuild succeeded! Proceed to Step [7] Package into AnyKernel3 Zip now?" "Y"; then
+                    menu_setup_anykernel
+                    return 0
+                fi
+            fi
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            log_error "Invalid selection!"
+            ;;
+    esac
+
     press_enter
 }
 
+run_compile_kernel_modules() {
+    local is_cli="${1:-0}"
+    print_header
+    echo -e "${C_BOLD}${C_BLUE}=== Build Loadable Kernel Modules (.ko) ===${C_RESET}\n"
+
+    setup_make_flags
+
+    # Toolchain verification
+    if [[ "${USE_LLVM}" -eq 1 ]]; then
+        if ! command -v clang >/dev/null 2>&1; then
+            log_error "Clang toolchain not installed or missing from PATH!"
+            log_warn "Please run Menu [1] Setup Toolchains first."
+            [[ "${is_cli}" -eq 0 ]] && press_enter
+            return 0
+        fi
+    else
+        if ! command -v "${CC_COMPILER}" >/dev/null 2>&1; then
+            log_error "Compiler ${CC_COMPILER} not found!"
+            log_warn "Please run Menu [1] Setup Toolchains first."
+            [[ "${is_cli}" -eq 0 ]] && press_enter
+            return 0
+        fi
+    fi
+
+    # Config verification
+    local cfg_file="${OUT_DIR}/.config"
+    if [[ ! -f "${cfg_file}" && -f ".config" ]]; then
+        cfg_file=".config"
+    fi
+    if [[ ! -f "${cfg_file}" ]]; then
+        if [[ "${is_cli}" -eq 1 ]]; then
+            log_info "Configuration missing. Generating Beryllium base config..."
+            apply_base_beryllium_config
+            cfg_file="${OUT_DIR}/.config"
+        else
+            log_warn "Kernel configuration not found in ${OUT_DIR}/.config."
+            if prompt_confirm "Generate Beryllium base configuration now?" "Y"; then
+                apply_base_beryllium_config
+                cfg_file="${OUT_DIR}/.config"
+            else
+                press_enter
+                return 0
+            fi
+        fi
+    fi
+
+    # Scan for configured loadable modules (=m) in .config
+    local configured_mods=()
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] && configured_mods+=("${line}")
+    done < <(grep "=m$" "${cfg_file}" | sed 's/=m//' || true)
+
+    if [[ ${#configured_mods[@]} -eq 0 ]]; then
+        log_warn "No loadable modules (=m) are currently enabled in ${cfg_file}!"
+        echo -e "${C_DIM}To enable modules, please use Menu [0] Menuconfig or apply custom config fragments.${C_RESET}"
+        [[ "${is_cli}" -eq 0 ]] && press_enter
+        return 0
+    fi
+
+    echo -e "${C_BOLD}Active loadable module configs in $(basename "${cfg_file}") (${#configured_mods[@]} enabled):${C_RESET}"
+    local i=1
+    for m in "${configured_mods[@]}"; do
+        echo -e "  $((i))) ${C_GREEN}${m}${C_RESET} [M]"
+        i=$((i + 1))
+    done
+    echo ""
+
+    local cores
+    cores="$(nproc --all 2>/dev/null || echo 4)"
+    log_info "Executing kernel modules compilation (make modules, ${cores} threads)..."
+    log_info "Build Log File: ${BUILD_LOG}"
+    local start_time
+    start_time=$(date +%s)
+
+    local mod_success=0
+    if make -j"${cores}" "${MAKE_FLAGS[@]}" modules 2>&1 | tee -a "${BUILD_LOG}"; then
+        mod_success=1
+    else
+        mod_success=0
+    fi
+
+    local end_time
+    end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+
+    # Scan for all compiled .ko files
+    local all_kos=()
+    while IFS= read -r -d '' ko_file; do
+        all_kos+=("${ko_file}")
+    done < <(find "${OUT_DIR}" -type f -name "*.ko" -print0 2>/dev/null || true)
+
+    if [[ ${#all_kos[@]} -eq 0 ]]; then
+        while IFS= read -r -d '' ko_file; do
+            all_kos+=("${ko_file}")
+        done < <(find "${KERNEL_DIR}" -maxdepth 4 -type f -name "*.ko" ! -path "*/AnyKernel3/*" ! -path "*/build_output/*" -print0 2>/dev/null || true)
+    fi
+
+    if [[ ${mod_success} -eq 1 && ${#all_kos[@]} -gt 0 ]]; then
+        mkdir -p "${RELEASE_DIR}/modules"
+        log_success "Kernel modules compilation completed successfully in ${elapsed}s!"
+        echo -e "  Total Modules Built : ${C_GREEN}${#all_kos[@]} module(s)${C_RESET}"
+        echo -e "  Module Directory    : ${C_CYAN}${RELEASE_DIR}/modules/${C_RESET}\n"
+
+        local idx=1
+        for ko in "${all_kos[@]}"; do
+            local bname
+            bname="$(basename "${ko}")"
+            cp -vf "${ko}" "${RELEASE_DIR}/modules/${bname}" >/dev/null 2>&1
+            local ksz
+            ksz=$(du -h "${ko}" | cut -f1)
+            echo -e "    $((idx))) ${C_WHITE}${bname}${C_RESET} (${ksz}) -> ${C_DIM}${RELEASE_DIR}/modules/${bname}${C_RESET}"
+            if [[ "${bname}" == "battery_saver.ko" ]]; then
+                cp -vf "${ko}" "${RELEASE_DIR}/battery_saver.ko" >/dev/null 2>&1
+            fi
+            idx=$((idx + 1))
+        done
+
+        # Direct push option via ADB if device is online
+        if [[ "${is_cli}" -eq 0 ]] && command -v adb >/dev/null 2>&1 && adb get-state >/dev/null 2>&1; then
+            echo ""
+            if prompt_confirm "Push all compiled module(s) to connected device (/data/local/tmp/modules/) via ADB?" "Y"; then
+                adb shell "mkdir -p /data/local/tmp/modules" >/dev/null 2>&1 || true
+                if adb push "${RELEASE_DIR}/modules/." /data/local/tmp/modules/; then
+                    log_success "All modules pushed to /data/local/tmp/modules/ on connected device!"
+                    echo -e "${C_CYAN}To load any module on device via root terminal / su:${C_RESET}"
+                    echo -e "  insmod /data/local/tmp/modules/<module_name>.ko"
+                else
+                    log_error "Failed to push modules via ADB."
+                fi
+            fi
+        fi
+    else
+        log_error "Kernel modules compilation failed! Please inspect ${BUILD_LOG}."
+    fi
+
+    if [[ "${is_cli}" -eq 0 ]]; then
+        press_enter
+    fi
+}
+
 # ------------------------------------------------------------------------------
-# MENU 6: SETUP AND PACK TO ANYKERNEL
+# MENU 7: SETUP & PACK TO ANYKERNEL3
 # ------------------------------------------------------------------------------
 menu_setup_anykernel() {
     print_header
-    echo -e "${C_BOLD}${C_BLUE}=== [6] Setup and Pack to AnyKernel ===${C_RESET}\n"
+    echo -e "${C_BOLD}${C_BLUE}=== [7] Setup & Pack to AnyKernel3 ===${C_RESET}\n"
 
     # Validate compiled kernel image
     local kernel_image=""
@@ -1435,6 +1702,24 @@ menu_setup_anykernel() {
     # Backup original anykernel.sh if present and not yet backed up
     if [[ -f "${anyk_script}" && ! -f "${anyk_script}.orig" ]]; then
         cp "${anyk_script}" "${anyk_script}.orig"
+    fi
+
+    # Check for all compiled modules (*.ko)
+    local anyk_kos=()
+    if [[ -d "${RELEASE_DIR}/modules" ]]; then
+        while IFS= read -r -d '' ko_file; do
+            anyk_kos+=("${ko_file}")
+        done < <(find "${RELEASE_DIR}/modules" -type f -name "*.ko" -print0 2>/dev/null || true)
+    fi
+    if [[ ${#anyk_kos[@]} -eq 0 && -d "${OUT_DIR}" ]]; then
+        while IFS= read -r -d '' ko_file; do
+            anyk_kos+=("${ko_file}")
+        done < <(find "${OUT_DIR}" -type f -name "*.ko" -print0 2>/dev/null || true)
+    fi
+
+    local do_modules=0
+    if [[ ${#anyk_kos[@]} -gt 0 ]]; then
+        do_modules=1
     fi
 
     # Generate dedicated beryllium AnyKernel3 configuration
@@ -1485,10 +1770,12 @@ dump_boot;
 write_boot;
 ## end boot install
 EOF
+    sed -i "s/^do\.modules=.*/do.modules=${do_modules}/" "${anyk_script}"
     chmod +x "${anyk_script}"
 
     # Clean old artifacts in AnyKernel directory
-    rm -f "${ANYKERNEL_DIR}/Image.gz-dtb" "${ANYKERNEL_DIR}/Image.gz" "${ANYKERNEL_DIR}/Image" "${ANYKERNEL_DIR}/dtbo.img" "${ANYKERNEL_DIR}"/*.zip
+    rm -f "${ANYKERNEL_DIR}/Image.gz-dtb" "${ANYKERNEL_DIR}/Image.gz" "${ANYKERNEL_DIR}/Image" "${ANYKERNEL_DIR}/dtbo.img" "${ANYKERNEL_DIR}"/*.ko "${ANYKERNEL_DIR}"/*.zip
+    rm -rf "${ANYKERNEL_DIR}/modules"
 
     # Inject Image.gz-dtb
     log_info "Injecting Image.gz-dtb into AnyKernel3..."
@@ -1498,6 +1785,19 @@ EOF
     if [[ -f "${OUT_DIR}/arch/arm64/boot/dtbo.img" ]]; then
         log_info "Injecting dtbo.img..."
         cp -v "${OUT_DIR}/arch/arm64/boot/dtbo.img" "${ANYKERNEL_DIR}/dtbo.img"
+    fi
+
+    # Inject all compiled modules if present
+    if [[ ${#anyk_kos[@]} -gt 0 ]]; then
+        log_info "Injecting ${#anyk_kos[@]} module(s) into AnyKernel3 package..."
+        mkdir -p "${ANYKERNEL_DIR}/modules/vendor/lib/modules"
+        for ko in "${anyk_kos[@]}"; do
+            local bname
+            bname="$(basename "${ko}")"
+            cp -vf "${ko}" "${ANYKERNEL_DIR}/modules/vendor/lib/modules/${bname}" >/dev/null 2>&1
+            cp -vf "${ko}" "${ANYKERNEL_DIR}/${bname}" >/dev/null 2>&1
+        done
+        log_success "Injected ${#anyk_kos[@]} module(s) into AnyKernel3 (vendor/lib/modules/ & root zip, do.modules=1)"
     fi
 
     # Prepare release output directory
@@ -1539,8 +1839,8 @@ EOF
         echo -e "${C_CYAN}This flashable zip is ready to be flashed via TWRP / OrangeFox Recovery on Pocophone F1.${C_RESET}"
 
         echo ""
-        if prompt_confirm "Would you like to flash this AnyKernel package now via ADB?" "Y"; then
-            flash_anykernel_package "${zip_target}"
+        if prompt_confirm "Flashable package ready! Proceed to Step [8] Deploy & Flash to Device now?" "Y"; then
+            menu_deploy_device "${zip_target}"
             return 0
         fi
     else
@@ -1551,7 +1851,7 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-# MENU 7: FLASH ANYKERNEL VIA ADB (LIVE ANDROID / RECOVERY)
+# MENU 8: DEPLOY & FLASH TO DEVICE (ADB / RECOVERY / MODULE PUSH)
 # ------------------------------------------------------------------------------
 SELECTED_ADB_SERIAL=""
 SELECTED_ADB_STATE=""
@@ -2048,10 +2348,133 @@ flash_anykernel_package() {
     press_enter
 }
 
-menu_flash_anykernel() {
+push_modules_to_device() {
+    local serial="$1"
+    local mod_dir="${RELEASE_DIR}/modules"
+
+    if [[ ! -d "${mod_dir}" ]] || [[ $(find "${mod_dir}" -name "*.ko" 2>/dev/null | wc -l) -eq 0 ]]; then
+        log_warn "No compiled modules found in ${mod_dir}."
+        if prompt_confirm "Would you like to compile all modules now?" "Y"; then
+            run_compile_kernel_modules 1
+        else
+            return 0
+        fi
+    fi
+
+    local ko_cnt
+    ko_cnt=$(find "${mod_dir}" -name "*.ko" 2>/dev/null | wc -l)
+    log_info "Creating /data/local/tmp/modules/ on device..."
+    adb -s "${serial}" shell "mkdir -p /data/local/tmp/modules" >/dev/null 2>&1 || true
+
+    log_info "Pushing ${ko_cnt} module(s) to device (/data/local/tmp/modules/)..."
+    if adb -s "${serial}" push "${mod_dir}/." /data/local/tmp/modules/; then
+        log_success "All ${ko_cnt} modules successfully pushed to /data/local/tmp/modules/!"
+        echo -e "${C_CYAN}To load any module via root terminal or Termux on device:${C_RESET}"
+        echo -e "  su -c insmod /data/local/tmp/modules/<module_name>.ko"
+    else
+        log_error "Failed to push modules via ADB!"
+    fi
+}
+
+push_and_load_battery_saver() {
+    local serial="$1"
+    local bs_ko="${RELEASE_DIR}/battery_saver.ko"
+    if [[ ! -f "${bs_ko}" ]]; then
+        bs_ko="${OUT_DIR}/drivers/misc/battery_saver/battery_saver.ko"
+    fi
+    if [[ ! -f "${bs_ko}" ]]; then
+        log_warn "battery_saver.ko not found in build_output."
+        if prompt_confirm "Compile kernel modules now?" "Y"; then
+            run_compile_kernel_modules 1
+            bs_ko="${RELEASE_DIR}/battery_saver.ko"
+        else
+            return 0
+        fi
+    fi
+
+    log_info "Pushing battery_saver.ko to /data/local/tmp/battery_saver.ko..."
+    if adb -s "${serial}" push "${bs_ko}" /data/local/tmp/battery_saver.ko; then
+        log_success "Module pushed to /data/local/tmp/battery_saver.ko!"
+        echo ""
+        if prompt_confirm "Execute 'insmod /data/local/tmp/battery_saver.ko' on device now? (requires root)" "Y"; then
+            local out
+            out=$(adb -s "${serial}" shell "su -c 'insmod /data/local/tmp/battery_saver.ko 2>&1'" || true)
+            [[ -n "${out}" ]] && echo "${out}"
+            log_info "Querying module telemetry on device..."
+            adb -s "${serial}" shell "cat /sys/module/battery_saver/parameters/status 2>/dev/null" || true
+        fi
+    else
+        log_error "Failed to push battery_saver.ko via ADB!"
+    fi
+}
+
+menu_reboot_device() {
+    local serial="$1"
+    echo -e "\n${C_BOLD}Reboot Options:${C_RESET}"
+    echo "  1) Reboot to Android System"
+    echo "  2) Reboot to Recovery (TWRP / OrangeFox)"
+    echo "  3) Reboot to Bootloader (Fastboot)"
+    echo ""
+    echo -en "${C_YELLOW}Select reboot option [1-3]: ${C_RESET}"
+    local rb_choice
+    read -r rb_choice || true
+    case "${rb_choice}" in
+        1) adb -s "${serial}" reboot ;;
+        2) adb -s "${serial}" reboot recovery ;;
+        3) adb -s "${serial}" reboot bootloader ;;
+        *) log_error "Invalid selection!" ;;
+    esac
+}
+
+menu_deploy_device() {
+    local preselected_zip="${1:-}"
     print_header
-    echo -e "${C_BOLD}${C_BLUE}=== [7] Flash AnyKernel via ADB (Live Android / Recovery) ===${C_RESET}\n"
-    flash_anykernel_package
+    echo -e "${C_BOLD}${C_BLUE}=== [8] Deploy & Flash to Device (ADB / Recovery) ===${C_RESET}\n"
+
+    if ! detect_adb_device; then
+        press_enter
+        return 0
+    fi
+
+    echo -e "Target Device: ${C_GREEN}${SELECTED_ADB_MODEL} (${SELECTED_ADB_CODENAME}) [${SELECTED_ADB_SERIAL} - ${SELECTED_ADB_STATE}]${C_RESET}\n"
+    echo -e "${C_BOLD}Select Deployment Action:${C_RESET}"
+    echo -e "  ${C_CYAN}1.${C_RESET} Flash AnyKernel3 Zip (Live Android Shell / TWRP Recovery / Sideload)"
+    echo -e "  ${C_CYAN}2.${C_RESET} Push All Compiled Modules (*.ko) to Device (/data/local/tmp/modules/)"
+    echo -e "  ${C_CYAN}3.${C_RESET} Push & Load Battery Saver Module on Device (insmod)"
+    echo -e "  ${C_CYAN}4.${C_RESET} Reboot Device (System / Recovery / Bootloader)"
+    echo -e "  ${C_CYAN}0.${C_RESET} Return to Main Menu"
+    echo ""
+    echo -en "${C_YELLOW}Select option [0-4] (default: 1): ${C_RESET}"
+    local dep_choice
+    read -r dep_choice || true
+    dep_choice="${dep_choice:-1}"
+
+    case "${dep_choice}" in
+        1)
+            flash_anykernel_package "${preselected_zip}"
+            ;;
+        2)
+            push_modules_to_device "${SELECTED_ADB_SERIAL}"
+            ;;
+        3)
+            push_and_load_battery_saver "${SELECTED_ADB_SERIAL}"
+            ;;
+        4)
+            menu_reboot_device "${SELECTED_ADB_SERIAL}"
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            log_error "Invalid selection!"
+            ;;
+    esac
+
+    press_enter
+}
+
+menu_flash_anykernel() {
+    menu_deploy_device "$@"
 }
 
 # ------------------------------------------------------------------------------
@@ -2063,11 +2486,18 @@ clean_artifacts() {
     echo -e "Directories and files to be removed:"
     echo "  - ${OUT_DIR}"
     echo "  - ${BUILD_LOG}"
+    echo "  - ${RELEASE_DIR}/modules"
+    echo "  - All compiled in-tree .ko modules"
     echo ""
     if prompt_confirm "Confirmation: Are you sure you want to clean all build artifacts?" "N"; then
         log_info "Removing build output directory..."
         rm -rf "${OUT_DIR}"
         rm -f "${BUILD_LOG}"
+        rm -rf "${RELEASE_DIR}/modules"
+        rm -f "${RELEASE_DIR}"/*.ko
+        find drivers/ -name "*.ko" -delete 2>/dev/null || true
+        find drivers/misc/battery_saver/ -type f \( -name "*.o" -o -name ".*.cmd" -o -name "*.mod.c" -o -name "modules.order" \) -delete 2>/dev/null || true
+        rm -rf drivers/misc/battery_saver/.tmp_versions
         log_success "Cleanup complete!"
     else
         log_info "Cleanup cancelled by user."
@@ -2085,48 +2515,53 @@ main_menu() {
         print_header
         print_status_bar
 
-        echo -e "${C_BOLD}Navigation Menu:${C_RESET}"
-        echo -e "  ${C_CYAN}0.${C_RESET} Open Menuconfig"
-        echo -e "  ${C_CYAN}1.${C_RESET} Setup Toolchains"
-        echo -e "  ${C_CYAN}2.${C_RESET} Install Dependencies"
-        echo -e "  ${C_CYAN}3.${C_RESET} Apply Custom Configuration"
-        echo -e "  ${C_CYAN}4.${C_RESET} Apply Patch"
-        echo -e "  ${C_CYAN}5.${C_RESET} Build Kernel"
-        echo -e "  ${C_CYAN}6.${C_RESET} Setup and Pack to AnyKernel"
-        echo -e "  ${C_CYAN}7.${C_RESET} Flash AnyKernel via ADB (Live Android / Recovery)"
+        echo -e "${C_BOLD}Guided Kernel Development Workflow:${C_RESET}"
+        echo -e "  ${C_DIM}[Preparation & Environment]${C_RESET}"
+        echo -e "  ${C_CYAN}1.${C_RESET} Install Build Dependencies"
+        echo -e "  ${C_CYAN}2.${C_RESET} Setup Compiler & Toolchains"
         echo ""
-        echo -e "  ${C_DIM}c. Clean Build Artifacts (out / log)${C_RESET}"
+        echo -e "  ${C_DIM}[Configuration & Patches]${C_RESET}"
+        echo -e "  ${C_CYAN}3.${C_RESET} Apply Kernel Configuration (Base / NetHunter / Fragments)"
+        echo -e "  ${C_CYAN}4.${C_RESET} Fine-Tune Configuration (Menuconfig / Drivers & Modules)"
+        echo -e "  ${C_CYAN}5.${C_RESET} Manage & Apply Patches"
+        echo ""
+        echo -e "  ${C_DIM}[Compilation & Deployment]${C_RESET}"
+        echo -e "  ${C_CYAN}6.${C_RESET} Build Kernel & Modules (Full Build / Image / Modules)"
+        echo -e "  ${C_CYAN}7.${C_RESET} Setup & Pack to Flashable AnyKernel3 Zip"
+        echo -e "  ${C_CYAN}8.${C_RESET} Deploy & Flash to Device (ADB / Recovery / Module Push)"
+        echo ""
+        echo -e "  ${C_DIM}c. Clean Build Directory & Artifacts (out / modules / logs)${C_RESET}"
         echo -e "  ${C_DIM}q. Exit${C_RESET}"
         echo ""
-        echo -en "${C_YELLOW}Select menu option [0-7, c, q]: ${C_RESET}"
+        echo -en "${C_YELLOW}Select workflow step [1-8, c, q]: ${C_RESET}"
 
         local main_choice
         read -r main_choice || true
 
         case "${main_choice}" in
-            0)
-                menu_open_menuconfig
-                ;;
             1)
-                menu_setup_toolchain
+                menu_install_dependencies
                 ;;
             2)
-                menu_install_dependencies
+                menu_setup_toolchain
                 ;;
             3)
                 menu_apply_config
                 ;;
             4)
-                menu_apply_patch
+                menu_open_menuconfig
                 ;;
             5)
-                menu_build_kernel
+                menu_apply_patch
                 ;;
             6)
-                menu_setup_anykernel
+                menu_build_kernel
                 ;;
             7)
-                menu_flash_anykernel
+                menu_setup_anykernel
+                ;;
+            8)
+                menu_deploy_device
                 ;;
             c|C)
                 clean_artifacts
@@ -2138,7 +2573,7 @@ main_menu() {
                 exit 0
                 ;;
             *)
-                log_error "Invalid selection! Please enter a number 0-7, c, or q."
+                log_error "Invalid selection! Please enter a number 1-8, c, or q."
                 sleep 1
                 ;;
         esac
@@ -2156,11 +2591,22 @@ cli_mode() {
     local do_config=""
     local do_nethunter=0
     local do_build=0
+    local do_module_only=0
+    local do_pack=0
+    local do_flash=0
     local user_cores
     user_cores="$(nproc --all 2>/dev/null || echo 4)"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --deps|-i)
+                menu_install_dependencies
+                exit 0
+                ;;
+            --module|--modules|-m)
+                do_module_only=1
+                shift
+                ;;
             --nethunter|-n)
                 do_nethunter=1
                 shift
@@ -2181,18 +2627,31 @@ cli_mode() {
                 fi
                 shift
                 ;;
+            --pack|-p)
+                do_pack=1
+                shift
+                ;;
+            --flash|-f)
+                do_flash=1
+                shift
+                ;;
             --all|-a)
                 do_nethunter=1
                 do_build=1
+                do_pack=1
                 shift
                 ;;
             --help|-h)
                 echo "Usage: $0 [options]"
                 echo "Options:"
+                echo "  -i, --deps               Check and install host build dependencies"
                 echo "  -n, --nethunter          Apply Beryllium base + Kali NetHunter config"
                 echo "  -c, --config <fragment>  Apply custom config fragment (e.g. configs/nethunter.config)"
-                echo "  -b, --build [threads]    Compile kernel (Image.gz-dtb and dtbs)"
-                echo "  -a, --all                Apply NetHunter config and compile kernel"
+                echo "  -m, --modules, --module  Compile all valid loadable modules (=m) from .config"
+                echo "  -b, --build [threads]    Compile kernel (Image.gz-dtb, dtbs and modules)"
+                echo "  -p, --pack               Package kernel and modules into AnyKernel3 zip"
+                echo "  -f, --flash              Deploy / flash AnyKernel3 zip via ADB"
+                echo "  -a, --all                Full pipeline: NetHunter config + Build + Pack"
                 echo "      --clean              Clean output directory before building"
                 echo "  -h, --help               Show this help message"
                 exit 0
@@ -2211,6 +2670,11 @@ cli_mode() {
         mkdir -p "${OUT_DIR}"
     fi
 
+    if [[ ${do_module_only} -eq 1 ]]; then
+        run_compile_kernel_modules 1
+        exit 0
+    fi
+
     if [[ ${do_nethunter} -eq 1 ]]; then
         apply_base_beryllium_config
         apply_nethunter_config
@@ -2221,6 +2685,14 @@ cli_mode() {
 
     if [[ ${do_build} -eq 1 ]]; then
         run_compile_kernel "${user_cores}"
+    fi
+
+    if [[ ${do_pack} -eq 1 ]]; then
+        menu_setup_anykernel
+    fi
+
+    if [[ ${do_flash} -eq 1 ]]; then
+        flash_anykernel_package
     fi
 }
 

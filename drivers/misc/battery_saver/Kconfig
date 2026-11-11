@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config BATTERY_SAVER
+	tristate "Adaptive SDM845 Battery Saver and Power Optimization Module"
+	depends on CPU_FREQ && HOTPLUG_CPU
+	default m
+	help
+	  This module provides adaptive battery saving and thermal power
+	  optimization for Qualcomm Snapdragon 845 (Xiaomi Poco F1 'beryllium').
+
+	  It clamps peak CPU frequencies on both Little (Silver) and Big (Gold)
+	  clusters, regulates Big cluster active core counts, and provides multiple
+	  power profiles (Balanced, Extreme, Ultra, Custom).
+
+	  When unloaded (rmmod), it automatically and completely restores original
+	  hardware frequency limits and core states.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called battery_saver.
