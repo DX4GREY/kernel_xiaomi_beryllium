@@ -1,0 +1,105 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Safe userspace interface for the built-in battery_saver kernel driver.
+
+set -eu
+
+PARAM_DIR=${BATTSAVE_PARAM_DIR:-/sys/module/battery_saver/parameters}
+
+die()
+{
+	printf 'batsave: %s\n' "$*" >&2
+	exit 1
+}
+
+require_root()
+{
+	[ "$(id -u)" -eq 0 ] || die "root privileges are required for this operation"
+}
+
+require_loaded()
+{
+	[ -d "$PARAM_DIR" ] || die "$MODULE is not loaded"
+}
+
+valid_profile()
+{
+	case "$1" in
+		passthrough|balanced|extreme|ultra|custom|0|1|2|3|4) ;;
+		*) die "profile must be passthrough, balanced, extreme, ultra, custom, or 0-4" ;;
+	esac
+}
+
+profile_id()
+{
+	case "$1" in
+		passthrough|0) printf '0\n' ;;
+		balanced|1) printf '1\n' ;;
+		extreme|2) printf '2\n' ;;
+		ultra|3) printf '3\n' ;;
+		custom|4) printf '4\n' ;;
+	esac
+}
+
+valid_uint()
+{
+	case "$1" in
+		''|*[!0-9]*) die "value must be a non-negative decimal integer" ;;
+	esac
+}
+
+set_param()
+{
+	param=$1
+	value=$2
+	valid_uint "$value"
+	[ -w "$PARAM_DIR/$param" ] || die "unknown or read-only parameter: $param"
+	printf '%s\n' "$value" > "$PARAM_DIR/$param"
+}
+
+usage()
+{
+	cat <<'EOF'
+Usage:
+  batsave status
+  batsave enable|disable
+  batsave profile <passthrough|balanced|extreme|ultra|custom|0-4>
+  batsave set <little_max_freq|little_min_freq|big_max_freq|big_min_freq|big_cores_online> <value>
+EOF
+}
+
+[ "$#" -gt 0 ] || { usage; exit 2; }
+
+case "$1" in
+	status)
+		require_loaded
+		cat "$PARAM_DIR/status"
+		;;
+	enable|disable)
+		require_root
+		require_loaded
+		printf '%s\n' "$([ "$1" = enable ] && printf 1 || printf 0)" > "$PARAM_DIR/enabled"
+		;;
+	profile)
+		require_root
+		require_loaded
+		[ "$#" -eq 2 ] || die "profile requires one value"
+		valid_profile "$2"
+		profile_id "$2" > "$PARAM_DIR/profile"
+		;;
+	set)
+		require_root
+		require_loaded
+		[ "$#" -eq 3 ] || die "set requires a parameter and a value"
+		case "$2" in
+			little_max_freq|little_min_freq|big_max_freq|big_min_freq|big_cores_online) ;;
+			*) die "parameter is not configurable: $2" ;;
+		esac
+		set_param "$2" "$3"
+		;;
+	*)
+		usage
+		exit 2
+		;;
+esac

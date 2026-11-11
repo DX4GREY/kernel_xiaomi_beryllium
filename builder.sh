@@ -1380,9 +1380,6 @@ run_compile_kernel() {
                     local ksz
                     ksz=$(du -h "${ko}" | cut -f1)
                     echo -e "    $((idx))) ${C_WHITE}${bname}${C_RESET} (${ksz}) -> ${C_DIM}${RELEASE_DIR}/modules/${bname}${C_RESET}"
-                    if [[ "${bname}" == "battery_saver.ko" ]]; then
-                        cp -vf "${ko}" "${RELEASE_DIR}/battery_saver.ko" >/dev/null 2>&1
-                    fi
                     idx=$((idx + 1))
                 done
             fi
@@ -1622,9 +1619,6 @@ run_compile_kernel_modules() {
             local ksz
             ksz=$(du -h "${ko}" | cut -f1)
             echo -e "    $((idx))) ${C_WHITE}${bname}${C_RESET} (${ksz}) -> ${C_DIM}${RELEASE_DIR}/modules/${bname}${C_RESET}"
-            if [[ "${bname}" == "battery_saver.ko" ]]; then
-                cp -vf "${ko}" "${RELEASE_DIR}/battery_saver.ko" >/dev/null 2>&1
-            fi
             idx=$((idx + 1))
         done
 
@@ -2376,38 +2370,6 @@ push_modules_to_device() {
     fi
 }
 
-push_and_load_battery_saver() {
-    local serial="$1"
-    local bs_ko="${RELEASE_DIR}/battery_saver.ko"
-    if [[ ! -f "${bs_ko}" ]]; then
-        bs_ko="${OUT_DIR}/drivers/misc/battery_saver/battery_saver.ko"
-    fi
-    if [[ ! -f "${bs_ko}" ]]; then
-        log_warn "battery_saver.ko not found in build_output."
-        if prompt_confirm "Compile kernel modules now?" "Y"; then
-            run_compile_kernel_modules 1
-            bs_ko="${RELEASE_DIR}/battery_saver.ko"
-        else
-            return 0
-        fi
-    fi
-
-    log_info "Pushing battery_saver.ko to /data/local/tmp/battery_saver.ko..."
-    if adb -s "${serial}" push "${bs_ko}" /data/local/tmp/battery_saver.ko; then
-        log_success "Module pushed to /data/local/tmp/battery_saver.ko!"
-        echo ""
-        if prompt_confirm "Execute 'insmod /data/local/tmp/battery_saver.ko' on device now? (requires root)" "Y"; then
-            local out
-            out=$(adb -s "${serial}" shell "su -c 'insmod /data/local/tmp/battery_saver.ko 2>&1'" || true)
-            [[ -n "${out}" ]] && echo "${out}"
-            log_info "Querying module telemetry on device..."
-            adb -s "${serial}" shell "cat /sys/module/battery_saver/parameters/status 2>/dev/null" || true
-        fi
-    else
-        log_error "Failed to push battery_saver.ko via ADB!"
-    fi
-}
-
 menu_reboot_device() {
     local serial="$1"
     echo -e "\n${C_BOLD}Reboot Options:${C_RESET}"
@@ -2440,7 +2402,7 @@ menu_deploy_device() {
     echo -e "${C_BOLD}Select Deployment Action:${C_RESET}"
     echo -e "  ${C_CYAN}1.${C_RESET} Flash AnyKernel3 Zip (Live Android Shell / TWRP Recovery / Sideload)"
     echo -e "  ${C_CYAN}2.${C_RESET} Push All Compiled Modules (*.ko) to Device (/data/local/tmp/modules/)"
-    echo -e "  ${C_CYAN}3.${C_RESET} Push & Load Battery Saver Module on Device (insmod)"
+    echo -e "  ${C_CYAN}3.${C_RESET} Query Built-in Battery Saver Status"
     echo -e "  ${C_CYAN}4.${C_RESET} Reboot Device (System / Recovery / Bootloader)"
     echo -e "  ${C_CYAN}0.${C_RESET} Return to Main Menu"
     echo ""
@@ -2457,7 +2419,8 @@ menu_deploy_device() {
             push_modules_to_device "${SELECTED_ADB_SERIAL}"
             ;;
         3)
-            push_and_load_battery_saver "${SELECTED_ADB_SERIAL}"
+            log_info "Querying built-in battery saver telemetry on device..."
+            adb -s "${SELECTED_ADB_SERIAL}" shell "cat /sys/module/battery_saver/parameters/status 2>/dev/null" || true
             ;;
         4)
             menu_reboot_device "${SELECTED_ADB_SERIAL}"

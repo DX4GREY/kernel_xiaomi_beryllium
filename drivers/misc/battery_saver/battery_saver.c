@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Adaptive Battery Saver and Power Optimization Module
+ * Adaptive Battery Saver and Power Optimization Driver
  * Target: Qualcomm Snapdragon 845 (SDM845) - Xiaomi Poco F1 (beryllium)
  *
  * Provides dynamic CPU frequency clamping and core management to maximize
  * battery endurance while retaining responsive performance.
  *
- * Full clean rollback on unload (rmmod) restoring original factory frequencies
- * and hotplugged cores.
+ * Built into the kernel image and active for the lifetime of the boot.
  */
 
 #define pr_fmt(fmt) "battery_saver: " fmt
@@ -46,7 +45,7 @@ struct bs_config {
 	unsigned int little_min_freq; /* kHz */
 	unsigned int big_max_freq;    /* kHz */
 	unsigned int big_min_freq;    /* kHz */
-	unsigned int big_cores_online; /* 0..4 big cores */
+	unsigned int big_cores_online; /* 1..4 big cores */
 };
 
 /* Default to Balanced Powersave */
@@ -60,7 +59,6 @@ static struct bs_config cfg = {
 	.big_cores_online = 4,       /* All 4 big cores active */
 };
 
-static cpumask_t orig_online_cpus;
 static cpumask_t bs_offlined_cpus;
 static DEFINE_MUTEX(bs_lock);
 static atomic_t adjustments_count = ATOMIC_INIT(0);
@@ -423,7 +421,7 @@ static int param_set_big_cores(const char *val, const struct kernel_param *kp)
 	if (ret)
 		return ret;
 
-	if (count > 4)
+	if (count < 1 || count > 4)
 		return -EINVAL;
 
 	mutex_lock(&bs_lock);
@@ -511,10 +509,8 @@ static int __init battery_saver_init(void)
 {
 	int ret;
 
-	pr_info("Initializing Adaptive Battery Saver for SDM845...\n");
+	pr_info("Initializing built-in Adaptive Battery Saver for SDM845...\n");
 
-	/* Snapshot original online CPU mask for exact rollback upon unload */
-	cpumask_copy(&orig_online_cpus, cpu_online_mask);
 	cpumask_clear(&bs_offlined_cpus);
 
 	/* Initialize default preset configuration */
@@ -537,38 +533,7 @@ static int __init battery_saver_init(void)
 	return 0;
 }
 
-static void __exit battery_saver_exit(void)
-{
-	unsigned int cpu;
-
-	pr_info("Unloading module, performing clean rollback to stock state...\n");
-
-	/* 1. Unregister policy notifier so no more limit clamping takes place */
-	cpufreq_unregister_notifier(&bs_cpufreq_nb, CPUFREQ_POLICY_NOTIFIER);
-
-	/* 2. Restore all CPUs that were online before module loaded */
-	mutex_lock(&bs_lock);
-	for_each_possible_cpu(cpu) {
-		if (cpumask_test_cpu(cpu, &orig_online_cpus) && !cpu_online(cpu)) {
-			pr_info("Restoring CPU%u to online state\n", cpu);
-			cpu_up(cpu);
-		}
-	}
-	cpumask_clear(&bs_offlined_cpus);
-	mutex_unlock(&bs_lock);
-
-	/* 3. Re-evaluate policy across all online CPUs to restore stock frequencies */
-	get_online_cpus();
-	for_each_online_cpu(cpu) {
-		cpufreq_update_policy(cpu);
-	}
-	put_online_cpus();
-
-	pr_info("Rollback complete. Stock CPU limits and core states restored.\n");
-}
-
 module_init(battery_saver_init);
-module_exit(battery_saver_exit);
 
 MODULE_AUTHOR("Antigravity");
 MODULE_DESCRIPTION("Adaptive SDM845 Battery Saver and Power Optimization Module");
