@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config BATTERY_SAVER
+	bool "Adaptive SDM845 Battery Saver and Power Optimization"
+	depends on CPU_FREQ && HOTPLUG_CPU && SMP
+	default n
+	help
+	  This built-in driver provides adaptive battery saving and thermal power
+	  optimization for Qualcomm Snapdragon 845 (Xiaomi Poco F1 'beryllium').
+
+	  It clamps peak CPU frequencies on both Little (Silver) and Big (Gold)
+	  clusters, regulates Big cluster active core counts, and provides multiple
+	  power profiles (Balanced, Extreme, Ultra, Custom).
+
+	  It is linked directly into the kernel image, initializes at boot, and
+	  exposes runtime controls through sysfs.
+
+	  Enable this option with Y to include battery_saver in the kernel.
